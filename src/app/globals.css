@@ -1,0 +1,159 @@
+@import "tailwindcss";
+
+@theme {
+  --color-cream: #f7efe3;
+  --color-paper: #fffbf4;
+  --color-linen: #efe3d2;
+  --color-espresso: #3a2116;
+  --color-roast: #5a3524;
+  --color-bean: #23130c;
+  --color-mocha: #8c7a6b;
+  --color-caramel: #c0651e;
+  --color-stamp: #3f8f5b;
+  --color-gold: #e0a02a;
+  --color-ember: #b3402f;
+
+  --font-display: var(--font-fraunces), "Fraunces", Georgia, serif;
+  --font-sans: var(--font-jakarta), "Plus Jakarta Sans", system-ui, sans-serif;
+
+  --shadow-card: 0 1px 2px rgba(58, 33, 22, 0.06), 0 8px 24px -18px rgba(58, 33, 22, 0.35);
+  --shadow-lift: 0 2px 4px rgba(58, 33, 22, 0.08), 0 18px 40px -24px rgba(58, 33, 22, 0.45);
+  --radius-card: 18px;
+}
+
+@layer base {
+  html {
+    -webkit-tap-highlight-color: transparent;
+  }
+  body {
+    background-color: var(--color-cream);
+    color: var(--color-bean);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    line-height: 1.5;
+    font-variant-numeric: tabular-nums;
+  }
+  ::selection {
+    background: var(--color-caramel);
+    color: #fff;
+  }
+  :focus-visible {
+    outline: 2px solid var(--color-caramel);
+    outline-offset: 2px;
+    border-radius: 6px;
+  }
+  input,
+  textarea,
+  select,
+  button {
+    font-family: inherit;
+    font-size: inherit;
+  }
+  /* responsive media: never let an image force container width */
+  img,
+  svg,
+  video,
+  canvas {
+    max-width: 100%;
+    height: auto;
+  }
+  /* long store names, emails, URLs and error text must wrap, not overflow */
+  td,
+  dd,
+  p,
+  li {
+    overflow-wrap: anywhere;
+  }
+}
+
+@utility label-caps {
+  font-family: var(--font-sans);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--color-mocha);
+}
+
+@utility display-num {
+  font-family: var(--font-display);
+  font-weight: 900;
+  font-variation-settings: "SOFT" 40, "WONK" 1;
+  letter-spacing: -0.02em;
+  line-height: 0.95;
+}
+
+@utility grain {
+  position: relative;
+}
+
+/* warm paper grain, generated rather than an image request */
+.grain::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: 0.35;
+  mix-blend-mode: multiply;
+  background-image: radial-gradient(rgba(140, 122, 107, 0.18) 0.5px, transparent 0.5px);
+  background-size: 3px 3px;
+}
+
+@keyframes settle {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes modal-in {
+  from {
+    opacity: 0;
+    transform: scale(0.97) translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.settle {
+  animation: settle 0.22s ease-out both;
+}
+.modal-in {
+  animation: modal-in 0.18s ease-out both;
+}
+.toast-in {
+  animation: toast-in 0.18s ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}
+
+@media print {
+  .no-print {
+    display: none !important;
+  }
+  body {
+    background: #fff;
+  }
+}

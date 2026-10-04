@@ -1,0 +1,15 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "events": {
+      "$clientId": {
+        ".read": "auth != null",
+        "$eventId": {
+          ".write": "newData.exists() && !data.exists()",
+          ".validate": "newData.hasChildren(['clientId', 'eventType', 'timestamp']) && newData.child('clientId').val() === $clientId && newData.child('eventType').isString() && newData.child('timestamp').isNumber()"
+        }
+      }
+    }
+  }
+}

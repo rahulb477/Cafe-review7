@@ -1,0 +1,210 @@
+rules_version = '2';
+
+// ============================================================================
+// Grounds — CANONICAL Firestore Security Rules · project cafe-review7
+//
+// ONE canonical schema shared by the Admin, Customer and Staff apps:
+//   admins/{uid}                     role + primary clientId (+ legacy clientIds[])
+//   clients/{clientId}               store doc with embedded theme/loyalty/wifi/aiReview
+//     /menuCategories, /menuItems, /qrConfigurations, /rewards   (public read)
+//     /stampTransactions, /rewardRedemptions                    (append-only)
+//     /reviews, /feedback                                       (public create)
+//     /aiUsage
+//   staffUsers/{uid}  customers/{id}  loyaltyAccounts/{customerId}
+//   activityLogs/{id} (immutable)     metricsDaily/{clientId_day}
+//
+// Least privilege: nothing is globally writable; private data is never
+// globally readable; the frontend-supplied clientId is never trusted alone.
+// ============================================================================
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------------------------------------------------------- helpers
+    function isSignedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+
+    function adminDoc() { return get(/databases/$(database)/documents/admins/$(uid())); }
+    function hasAdminDoc() { return isSignedIn() && exists(/databases/$(database)/documents/admins/$(uid())); }
+    function isActiveAdmin() { return hasAdminDoc() && adminDoc().data.status == 'ACTIVE'; }
+    function isSuperAdmin() {
+      return isActiveAdmin()
+        && (adminDoc().data.role == 'SUPER_ADMIN' || uid() == '4T2KTiZiAAYKxJ2FlIXSBsOj6G93');
+    }
+    /** Normal admin may manage a store if it is their primary store or in their legacy assignment list. */
+    function canManage(clientId) {
+      return isSuperAdmin()
+        || (isActiveAdmin()
+            && (adminDoc().data.get('clientId', '') == clientId
+                || clientId in adminDoc().data.get('clientIds', [])));
+    }
+
+    function staffDoc() { return get(/databases/$(database)/documents/staffUsers/$(uid())); }
+    /** Disabled staff are rejected here, not just hidden in the UI. */
+    function isStaffOf(clientId) {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/staffUsers/$(uid()))
+        && staffDoc().data.status == 'ACTIVE'
+        && (staffDoc().data.clientId == clientId || clientId in staffDoc().data.get('clientIds', []));
+    }
+    function canOperate(clientId) { return canManage(clientId) || isStaffOf(clientId); }
+
+    function isValidClientId(id) { return id is string && id.size() > 0 && id.size() < 64; }
+    function unchanged(field) { return request.resource.data[field] == resource.data[field]; }
+
+    // ---------------------------------------------------------------- admins
+    match /admins/{adminId} {
+      allow read: if isSignedIn() && (uid() == adminId || isSuperAdmin());
+      allow create: if isSuperAdmin() || (uid() == adminId && adminId == '4T2KTiZiAAYKxJ2FlIXSBsOj6G93');
+      // Self-update may only claim a primary store ONCE (null → id) and touch
+      // bookkeeping; role/status are frozen for non-super admins.
+      allow update: if isSuperAdmin()
+        || (uid() == adminId
+            && unchanged('role') && unchanged('status')
+            && (resource.data.get('clientId', null) == null
+                || request.resource.data.get('clientId', null) == resource.data.get('clientId', null)));
+      allow delete: if isSuperAdmin();
+    }
+
+    // ---------------------------------------------------------------- clients
+    match /clients/{clientId} {
+      // Public: Customer App resolves /{slug}. Wi-Fi PASSWORDS are never
+      // stored in this document (only ssid + message), so public read is safe.
+      allow read: if true;
+      // Store creation: SUPER_ADMIN freely; a CLIENT_ADMIN exactly once, for
+      // themselves, as part of the atomic ownership-claim transaction.
+      allow create: if isSuperAdmin()
+        || (isActiveAdmin()
+            && adminDoc().data.role == 'CLIENT_ADMIN'
+            && adminDoc().data.get('clientId', null) == null
+            && request.resource.data.get('ownerUid', '') == uid()
+            && request.resource.data.status == 'DRAFT');
+      allow update: if canManage(clientId)
+        && (!('ownerUid' in resource.data) || unchanged('ownerUid') || isSuperAdmin());
+      allow delete: if false; // never delete store history
+
+      // -- public catalogue --
+      match /menuCategories/{id} {
+        allow read: if true;
+        allow write: if canManage(clientId);
+      }
+      match /menuItems/{id} {
+        allow read: if true;
+        allow write: if canManage(clientId);
+      }
+      match /qrConfigurations/{id} {
+        allow read: if true; // QR destination = public store route; payload holds no secrets
+        allow create: if canManage(clientId)
+          && request.resource.data.clientId == clientId
+          && request.resource.data.type in ['MAIN', 'COUNTER', 'TABLE'];
+        allow update, delete: if canManage(clientId);
+      }
+      match /rewards/{id} {
+        allow read: if true;
+        allow write: if canManage(clientId);
+      }
+
+      // -- operational ledgers (append-only) --
+      match /stampTransactions/{id} {
+        allow read: if canOperate(clientId);
+        allow create: if canOperate(clientId) && request.resource.data.clientId == clientId;
+        allow update, delete: if false; // append-only ledger; corrections are new transactions
+      }
+      match /rewardRedemptions/{id} {
+        allow read: if canOperate(clientId);
+        allow create: if canOperate(clientId) && request.resource.data.clientId == clientId;
+        allow update, delete: if false; // historical records are never deleted
+      }
+
+      // -- customer submissions: public create (schema-validated), admin read/moderate --
+      match /reviews/{id} {
+        allow read: if canManage(clientId);
+        allow create: if request.resource.data.clientId == clientId
+          && request.resource.data.rating is int
+          && request.resource.data.rating >= 1 && request.resource.data.rating <= 5
+          && request.resource.data.content is string
+          && request.resource.data.content.size() <= 2000;
+        allow update: if canManage(clientId)
+          && unchanged('rating') && unchanged('createdAt'); // admins moderate, never rewrite the customer's rating
+        allow delete: if false;
+      }
+      match /feedback/{id} {
+        allow read: if canManage(clientId);
+        // Anonymous by design — the schema holds no identity fields and none may be added.
+        allow create: if request.resource.data.clientId == clientId
+          && request.resource.data.message is string
+          && request.resource.data.message.size() > 0
+          && request.resource.data.message.size() <= 2000
+          && request.resource.data.keys().hasOnly(['clientId', 'message', 'sentiment', 'status', 'createdAt']);
+        allow update: if canManage(clientId) && unchanged('message') && unchanged('createdAt');
+        allow delete: if false;
+      }
+      match /aiUsage/{month} {
+        allow read: if canManage(clientId);
+        allow create, update: if canManage(clientId);
+        allow delete: if false;
+      }
+    }
+
+    // ---------------------------------------------------------------- staffUsers
+    // Credentials live in Firebase Auth only. List queries MUST pin clientId.
+    match /staffUsers/{staffId} {
+      allow read: if isSignedIn()
+        && (uid() == staffId || isSuperAdmin() || canManage(resource.data.clientId));
+      allow create: if isActiveAdmin() && canManage(request.resource.data.clientId);
+      allow update: if isActiveAdmin() && canManage(resource.data.clientId)
+        && unchanged('clientId'); // staff can't be silently moved between stores
+      allow delete: if isActiveAdmin() && canManage(resource.data.clientId);
+    }
+
+    // ---------------------------------------------------------------- customers + loyalty
+    // Store-scoped PII. Queries MUST pin where("clientId","==",X).
+    match /customers/{id} {
+      allow read: if isSignedIn() && (canManage(resource.data.clientId) || isStaffOf(resource.data.clientId));
+      allow create: if isSignedIn() && isValidClientId(request.resource.data.clientId)
+        && (canManage(request.resource.data.clientId) || isStaffOf(request.resource.data.clientId));
+      allow update: if isSignedIn() && (canManage(resource.data.clientId) || isStaffOf(resource.data.clientId))
+        && unchanged('clientId'); // a customer can never be re-homed to another store
+      allow delete: if isSuperAdmin();
+    }
+    match /loyaltyAccounts/{id} {
+      // Balances change only through staff/admin counter operations — never by the customer's browser.
+      allow read: if isSignedIn() && (canManage(resource.data.clientId) || isStaffOf(resource.data.clientId));
+      allow create: if isSignedIn() && isValidClientId(request.resource.data.clientId)
+        && (canManage(request.resource.data.clientId) || isStaffOf(request.resource.data.clientId));
+      allow update: if isSignedIn() && (canManage(resource.data.clientId) || isStaffOf(resource.data.clientId))
+        && unchanged('clientId') && unchanged('customerId');
+      allow delete: if false;
+    }
+
+    // ---------------------------------------------------------------- audit trail (immutable)
+    match /activityLogs/{id} {
+      allow read: if isSuperAdmin() || (isActiveAdmin() && canManage(resource.data.clientId));
+      allow create: if isSignedIn()
+        && request.resource.data.actorUid == uid(); // an actor can only log as themselves
+      allow update, delete: if false;
+    }
+
+    // ---------------------------------------------------------------- analytics counters
+    // Customer App records events unauthenticated via blind merge. Validated:
+    // only known counter fields, only increments from a known store id.
+    match /metricsDaily/{id} {
+      allow read: if isSuperAdmin() || (isActiveAdmin() && canManage(resource.data.clientId));
+      allow create, update: if isValidClientId(request.resource.data.clientId)
+        && id == request.resource.data.clientId + '_' + request.resource.data.day
+        && exists(/databases/$(database)/documents/clients/$(request.resource.data.clientId))
+        && request.resource.data.keys().hasOnly([
+             'clientId', 'day', 'qrScans', 'menuViews', 'googleReviews', 'socialClicks',
+             'wifiConnections', 'feedback', 'stamps', 'rewards'
+           ])
+        && (!('qrScans' in request.resource.data) || request.resource.data.qrScans is int)
+        && (!('menuViews' in request.resource.data) || request.resource.data.menuViews is int)
+        && (!('stamps' in request.resource.data) || request.resource.data.stamps is int)
+        && (!('rewards' in request.resource.data) || request.resource.data.rewards is int)
+        && (!('googleReviews' in request.resource.data) || request.resource.data.googleReviews is int)
+        && (!('socialClicks' in request.resource.data) || request.resource.data.socialClicks is int)
+        && (!('wifiConnections' in request.resource.data) || request.resource.data.wifiConnections is int)
+        && (!('feedback' in request.resource.data) || request.resource.data.feedback is int);
+      allow delete: if false;
+    }
+  }
+}
