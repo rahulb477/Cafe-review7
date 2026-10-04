@@ -6,7 +6,8 @@ import { Eye, EyeOff, Lock, Mail, ShieldCheck } from "lucide-react";
 import { authErrorCode, authErrorMessage, sendReset, signInWithPassword, signOutUser } from "@/lib/firebase/auth";
 import { AdminResolveError, resolveAdminProfile } from "@/lib/firebase/admin-profile";
 import { validateFirebaseConfig, firebaseConfig } from "@/services/firebase/firebaseClient";
-import { useAuth } from "@/context/AuthContext";
+import { adminService } from "@/lib/firebase/services";
+import { DASHBOARD_PATH, SETUP_PATH, homePathFor, useAuth } from "@/context/AuthContext";
 import { Button, Card, Field, Input } from "@/components/ui";
 import { ToastHost, emitToast } from "@/components/interactive";
 import { BrandMark } from "@/components/shell";
@@ -34,9 +35,11 @@ export default function LoginPage() {
   // instead of surfacing later as a confusing auth failure.
   const configError = useMemo(() => validateFirebaseConfig(), []);
 
-  // Already authenticated and authorized → straight to the dashboard.
+  // Already authenticated and authorized → dashboard, or /setup for a
+  // first-time admin who does not own a store yet.
   useEffect(() => {
-    if (auth.phase === "ready") router.replace("/admin");
+    const target = homePathFor(auth.phase);
+    if (target) router.replace(target);
   }, [auth.phase, router]);
 
   const submit = async (e: React.FormEvent<HTMLFormElement>) => {
@@ -74,8 +77,11 @@ export default function LoginPage() {
       trail.push([STEPS[1], "ok"]);
 
       // STEPS 3–5 — UID verification, admins/{uid} read, role/status.
+      let ownsStore = true;
       try {
-        await resolveAdminProfile(user);
+        const adminDoc = await resolveAdminProfile(user);
+        // one admin = one store: no admins/{uid}.clientId → first-time setup.
+        ownsStore = adminDoc.role === "SUPER_ADMIN" || Boolean(adminService.primaryStoreOf(adminDoc));
         trail.push([STEPS[2], "ok"], [STEPS[3], "ok"], [STEPS[4], "ok"]);
       } catch (err) {
         if (err instanceof AdminResolveError) {
@@ -92,8 +98,9 @@ export default function LoginPage() {
         throw err;
       }
 
-      // STEP 6 — open /admin (AuthContext re-resolves and renders the dashboard).
-      router.replace("/admin");
+      // STEP 6 — the socket decides: dashboard, or first-time store setup.
+      // (AuthContext re-resolves and the route guards keep it authoritative.)
+      router.replace(ownsStore ? DASHBOARD_PATH : SETUP_PATH);
     } catch (err) {
       setDiag({ error: authErrorMessage(err), code: authErrorCode(err), steps: trail });
       setPending(false);
@@ -207,7 +214,7 @@ export default function LoginPage() {
                   ) : null}
                 </div>
               ) : null}
-              {auth.phase === "error" && !diag && !configError ? (
+              {auth.phase === "ERROR" && !diag && !configError ? (
                 <p role="alert" className="rounded-xl bg-ember/8 px-3 py-2 text-[12px] font-semibold text-ember">
                   {auth.error}
                 </p>

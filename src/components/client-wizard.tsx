@@ -59,10 +59,16 @@ export function StoreSetupWizard({
   actor,
   initialDraft,
   initialStoreId,
+  onPublished,
+  onSetupConflict,
 }: {
   actor: Actor;
   initialDraft?: StoreFormData | null;
   initialStoreId?: string | null;
+  /** Called once the store is published — first-time setup redirects to /dashboard. */
+  onPublished?: (result: { storeId: string; slug: string }) => void;
+  /** Called when the atomic transaction reports that a store already exists (second tab). */
+  onSetupConflict?: () => void;
 }) {
   const [step, setStep] = useState(0);
   const [form, setForm] = useState<StoreFormData>(() => initialDraft ?? emptyForm());
@@ -114,7 +120,11 @@ export function StoreSetupWizard({
       return result.storeId;
     } catch (err) {
       console.error("STORE_DRAFT_SAVE_ERROR", err);
-      emitToast("error", fireErrorMessage(err));
+      const message = fireErrorMessage(err);
+      emitToast("error", message);
+      // A second tab finished first: the transaction aborted, so this tab must
+      // NOT retry creation — it follows the store that already exists.
+      if (/already complete/i.test(message)) onSetupConflict?.();
       return null;
     } finally {
       setSavingDraft(false);
@@ -165,6 +175,8 @@ export function StoreSetupWizard({
       setPublishedSlug(slug);
       setPhase("success");
       emitToast("success", "Store published successfully");
+      // First-time setup: brief success state, then the caller navigates on.
+      onPublished?.({ storeId: id, slug });
     } catch (err) {
       const code = (err as { code?: string })?.code;
       const message = err instanceof Error ? err.message : "Store publishing failed";
@@ -179,6 +191,7 @@ export function StoreSetupWizard({
       if (failed >= 0) mark(failed, "fail");
       setPublishError({ code, message });
       setPhase("error");
+      if (/already complete/i.test(message)) onSetupConflict?.();
     } finally {
       // The button can NEVER stay stuck on "Publishing…": phase is always
       // terminal here (success or error), and success renders its own panel.

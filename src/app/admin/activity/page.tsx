@@ -13,19 +13,19 @@ export default function GlobalActivityPage() {
 }
 
 function GlobalActivity({ role }: { role: string }) {
-  const { allowedClientIds } = useAuth();
+  const { allowedClientIds, isSuperAdmin, storeId } = useAuth();
   const [q, setQ] = useState("");
   const [scope, setScope] = useState("ALL");
 
+  // Normal admins: ONE store, read directly from admins/{uid}.clientId.
+  // SUPER_ADMIN: platform-wide (existing behaviour) with the store filter.
   const load = useLoad(
     async () => {
-      const [rows, clients] = await Promise.all([
-        activityService.global(allowedClientIds),
-        clientService.listAllowed(allowedClientIds),
-      ]);
+      const rows = await activityService.global(allowedClientIds);
+      const clients = isSuperAdmin ? await clientService.listAllowed(null) : await clientService.listByIds(storeId ? [storeId] : []);
       return { rows, clients };
     },
-    [allowedClientIds],
+    [allowedClientIds, isSuperAdmin, storeId],
   );
 
   const rows = useMemo(() => {
@@ -38,26 +38,28 @@ function GlobalActivity({ role }: { role: string }) {
   }, [load.data, q, scope]);
 
   const clientName = (id: string | null) =>
-    id ? (load.data?.clients.find((c) => c.id === id)?.businessName ?? "Unknown client") : null;
+    id ? (load.data?.clients.find((c) => c.id === id)?.businessName ?? "Unknown store") : null;
 
   return (
     <>
       <PageHeader
-        eyebrow={role === "SUPER_ADMIN" ? "Platform-wide · every business" : "Restricted to the businesses assigned to you"}
-        title="Global Activity"
-        subtitle="Cross-tenant audit trail from the activityLogs collection. Client admins only ever see their own businesses."
+        eyebrow={isSuperAdmin ? "Platform-wide · every business" : "Your store only"}
+        title={isSuperAdmin ? "Global Activity" : "Store Activity"}
+        subtitle="Cross-tenant audit trail from the activityLogs collection. A single-store admin only ever sees their own store."
       />
 
       <div className="mb-4 flex flex-wrap items-center gap-2">
         <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search activity…" className="sm:max-w-xs" />
-        <select value={scope} onChange={(e) => setScope(e.target.value)} className="rounded-xl border border-linen bg-paper px-3 py-2.5 text-[12px]">
-          <option value="ALL">All businesses</option>
-          {(load.data?.clients ?? []).map((c) => (
-            <option key={c.id} value={c.id}>
-              {c.businessName}
-            </option>
-          ))}
-        </select>
+        {isSuperAdmin ? (
+          <select value={scope} onChange={(e) => setScope(e.target.value)} className="rounded-xl border border-linen bg-paper px-3 py-2.5 text-[12px]">
+            <option value="ALL">All businesses</option>
+            {(load.data?.clients ?? []).map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.businessName}
+              </option>
+            ))}
+          </select>
+        ) : null}
       </div>
 
       {load.loading && !load.data ? (
@@ -65,14 +67,20 @@ function GlobalActivity({ role }: { role: string }) {
       ) : load.error && !load.data ? (
         <ErrorState message={load.error} action={<Button onClick={load.reload}>Retry</Button>} />
       ) : rows.length === 0 ? (
-        <EmptyState title="No activity yet" body="Platform and tenant actions will stream into this log." icon={<Activity className="size-5" />} />
+        <EmptyState title="No activity yet" body="Platform and store actions will stream into this log." icon={<Activity className="size-5" />} />
       ) : (
         <div className="space-y-2.5">
           {rows.map((r) => (
             <Card key={r.id} className="p-3.5">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <span className="text-[12px] font-bold text-espresso">{r.action.replace(/_/g, " ")}</span>
-                {r.clientId ? <Badge tone="neutral">{clientName(r.clientId)}</Badge> : <Badge tone="ink">Platform</Badge>}
+                {isSuperAdmin ? (
+                  r.clientId ? (
+                    <Badge tone="neutral">{clientName(r.clientId)}</Badge>
+                  ) : (
+                    <Badge tone="ink">Platform</Badge>
+                  )
+                ) : null}
               </div>
               <p className="mt-1 text-[12px] text-mocha">{r.target || "—"}</p>
               <p className="mt-1 text-[11px] text-mocha">

@@ -24,6 +24,28 @@ const now = () => Date.now();
 const slugify = (input: string) =>
   input.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
 
+/**
+ * Public route segments that must never be claimed by a store slug — the
+ * admin console, the staff app and the top-level auth/route aliases.
+ */
+const RESERVED_SLUGS = new Set([
+  "admin",
+  "api",
+  "_next",
+  "staff",
+  "setup",
+  "stores",
+  "dashboard",
+  "login",
+  "favicon.ico",
+]);
+
+function assertSlugAvailable(slug: string) {
+  if (RESERVED_SLUGS.has(slug)) {
+    throw new Error(`The address /${slug} is reserved by the platform. Choose a different store slug.`);
+  }
+}
+
 /* ------------------------------------------------------------------ *
  * Shared platform schema — clients/{clientId} with embedded config:
  * theme, socialLinks, wifi, loyalty, aiReview, googleReviewUrl,
@@ -277,9 +299,20 @@ export const clientService = {
     return rows.map(clientFromRecord).sort((a, b) => a.businessName.localeCompare(b.businessName));
   },
 
+  /** Platform-level listing — SUPER_ADMIN only (Stores page). */
   async listAllowed(allowedClientIds: string[] | null): Promise<ClientDoc[]> {
     const all = await this.listAll();
     return allowedClientIds === null ? all : all.filter((c) => allowedClientIds.includes(c.id));
+  },
+
+  /**
+   * Direct document reads for a KNOWN scope (a normal admin's single store).
+   * Never "read every client and filter on the client" — the caller already
+   * resolved the ids from admins/{uid}.clientId.
+   */
+  async listByIds(clientIds: string[]): Promise<ClientDoc[]> {
+    const rows = await Promise.all(clientIds.map((id) => this.get(id)));
+    return rows.flatMap((r) => (r ? [r.client] : []));
   },
 
   async get(clientId: string): Promise<{ client: ClientDoc; settings: ClientSettingsDoc } | null> {
@@ -361,6 +394,7 @@ export const clientService = {
     }
     const slug = slugify(form.slug?.trim() || form.businessName);
     if (!slug) throw new Error("Store name is required before saving.");
+    assertSlugAvailable(slug);
     const clash = await opGuard(
       listWhere<ClientRecord>(COL.clients, [where("slug", "==", slug)], 2),
       "Slug availability check (Firestore read)",
@@ -629,6 +663,7 @@ export const clientService = {
   ): Promise<{ clientId: string; slug: string }> {
     const slug = slugify(input.slug?.trim() || input.businessName);
     if (!slug) throw new Error("Business name is required.");
+    assertSlugAvailable(slug);
     if (await this.bySlug(slug)) throw new Error(`The address /${slug} is already in use.`);
     const clientId = newId("cli");
     const [logo, favicon, coverImage, rewardImage] = await Promise.all([

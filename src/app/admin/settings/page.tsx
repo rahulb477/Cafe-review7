@@ -12,9 +12,9 @@ import { runOp, useLoad } from "@/lib/use-load";
 import { SUPER_ADMIN_UID } from "@/lib/firebase/client";
 
 const ROLE_COPY: Record<string, string> = {
-  SUPER_ADMIN: "Full access to every business, platform activity and admin accounts.",
-  CLIENT_ADMIN: "Assigned businesses only — cannot see or touch other tenants.",
-  MANAGER: "Operational management of assigned businesses. Cannot create or suspend businesses.",
+  SUPER_ADMIN: "Platform-level access: every store, global activity and admin accounts.",
+  CLIENT_ADMIN: "Owns exactly ONE store. No store list, no store switcher — everything is scoped to that store.",
+  MANAGER: "Operational management of the one store assigned to them. Cannot create or suspend stores.",
 };
 
 export default function SettingsPage() {
