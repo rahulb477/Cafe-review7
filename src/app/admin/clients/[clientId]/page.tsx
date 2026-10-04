@@ -156,6 +156,20 @@ function Detail({ ctx }: { ctx: ClientCtx }) {
 
           <div className="space-y-5">
             <Card className="p-5">
+              <SectionTitle right={client.status === "DRAFT" ? <Badge tone="gold">DRAFT</Badge> : undefined}>
+                Store Setup
+              </SectionTitle>
+              <p className="mb-3 text-[11.5px] text-mocha">
+                {client.status === "DRAFT"
+                  ? "This store is saved as a draft. Finish the remaining fields and publish to make it visible to guests."
+                  : "Business, branding, theme, menu, Google Reviews, social, Wi-Fi, loyalty and AI for THIS store."}
+              </p>
+              <LinkButton href={`/admin/clients/${client.id}/setup`} variant={client.status === "DRAFT" ? "primary" : "outline"}>
+                {client.status === "DRAFT" ? "Finish setup & publish" : "Open store setup"}
+              </LinkButton>
+            </Card>
+
+            <Card className="p-5">
               <SectionTitle>Live configuration</SectionTitle>
               <dl className="space-y-2.5 text-[12.5px]">
                 {[

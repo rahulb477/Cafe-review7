@@ -38,22 +38,34 @@ export function PageSkeleton() {
   );
 }
 
-/** Workspace-level page (no specific tenant). */
+/**
+ * Workspace-level page (Dashboard, Activity, Settings).
+ *
+ * ONE ADMIN = ONE STORE: the shell receives the authenticated admin's single
+ * store (admins/{uid}.clientId) so the sidebar/header show THEIR store. It is
+ * never a selector — for a normal admin there is exactly one value, and it
+ * comes from the ownership field, not from a client list.
+ */
 export function WorkspacePage({ children }: { children: (ctx: { actor: Actor; role: string }) => ReactNode }) {
   const guard = useAdminGuard();
-  if (guard.phase !== "ready" || !guard.admin) return <GuardScreen guard={guard} />;
+  if (guard.phase !== "READY" || !guard.admin) return <GuardScreen guard={guard} />;
   const actor: Actor = { uid: guard.admin.uid, name: guard.admin.name, role: guard.admin.role };
   return (
-    <AdminShell admin={{ name: guard.admin.name, email: guard.admin.email ?? "", role: guard.admin.role }} client={null}>
+    <AdminShell
+      admin={{ name: guard.admin.name, email: guard.admin.email ?? "", role: guard.admin.role }}
+      client={null}
+      storeId={guard.storeId}
+    >
       {children({ actor, role: guard.admin.role })}
     </AdminShell>
   );
 }
 
 /**
- * Tenant-scoped page: verifies assignment and subscribes to the client
- * document in real time — branding, loyalty and status changes from any
- * admin session appear immediately without a refresh.
+ * Tenant-scoped page: verifies that the route's clientId is the admin's own
+ * store (or any store for SUPER_ADMIN) and subscribes to the client document
+ * in real time — branding, loyalty and status changes from any admin session
+ * appear immediately without a refresh.
  */
 export function ClientPage({
   clientId,
@@ -63,7 +75,7 @@ export function ClientPage({
   children: (ctx: ClientCtx) => ReactNode;
 }) {
   const guard = useAdminGuard(clientId);
-  const ready = guard.phase === "ready" && !guard.forbidden && Boolean(guard.admin);
+  const ready = guard.phase === "READY" && !guard.forbidden && Boolean(guard.admin);
   const [live, setLive] = useState<{
     loading: boolean;
     error: string | null;
@@ -82,7 +94,7 @@ export function ClientPage({
   const { loading, error, data } = live;
   const reload = () => undefined; // live subscription keeps data fresh
 
-  if (guard.phase !== "ready" || guard.forbidden || !guard.admin) return <GuardScreen guard={guard} />;
+  if (guard.phase !== "READY" || guard.forbidden || !guard.admin) return <GuardScreen guard={guard} />;
   const admin = guard.admin;
   const actor: Actor = { uid: admin.uid, name: admin.name, role: admin.role };
 
@@ -99,13 +111,17 @@ export function ClientPage({
       : null;
 
   return (
-    <AdminShell admin={{ name: admin.name, email: admin.email ?? "", role: admin.role }} client={shellClient}>
+    <AdminShell
+      admin={{ name: admin.name, email: admin.email ?? "", role: admin.role }}
+      client={shellClient}
+      storeId={guard.storeId ?? clientId}
+    >
       {loading && !data ? (
         <PageSkeleton />
       ) : error && !data ? (
         <ErrorState message={error} />
       ) : !data?.client || !data.settings ? (
-        <ErrorState message="This business (or its settings document) was not found in Firestore." />
+        <ErrorState message="This store (or its settings document) was not found in Firestore." />
       ) : (
         children({ actor, role: admin.role, client: data.client, settings: data.settings, reloadClient: reload })
       )}

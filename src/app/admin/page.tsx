@@ -8,6 +8,7 @@ import {
   BadgePercent,
   Building2,
   QrCode,
+  Rocket,
   Sparkles,
   Star,
   Users,
@@ -17,6 +18,7 @@ import { WorkspacePage, opToast } from "@/components/admin-page";
 import {
   Card,
   EmptyState,
+  ErrorState,
   LinkButton,
   MeterBar,
   PageHeader,
@@ -36,51 +38,83 @@ import {
 } from "@/lib/firebase/services";
 import { seedDemoClients } from "@/lib/firebase/seed";
 import { useLoad, runOp } from "@/lib/use-load";
+import type { Actor, ClientDoc } from "@/lib/firebase/types";
+
+type DashParams = { client?: string; range?: string };
 
 export default function DashboardPage({
   searchParams,
 }: {
-  searchParams: Promise<{ client?: string; range?: string }>;
+  searchParams: Promise<DashParams>;
 }) {
   const params = use(searchParams);
-  return <WorkspacePage>{({ actor }) => <Dashboard actor={actor} params={params} />}</WorkspacePage>;
+  return (
+    <WorkspacePage>
+      {({ actor, role }) =>
+        role === "SUPER_ADMIN" ? (
+          <SuperAdminDashboard actor={actor} params={params} />
+        ) : (
+          <OwnStoreDashboard actor={actor} params={params} />
+        )
+      }
+    </WorkspacePage>
+  );
 }
 
-function Dashboard({
-  actor,
-  params,
-}: {
-  actor: { uid: string; name: string; role: string };
-  params: { client?: string; range?: string };
-}) {
-  const { allowedClientIds, primaryStoreId } = useAuth();
-  const isSuper = actor.role === "SUPER_ADMIN";
+/**
+ * NORMAL ADMIN — no store list, no selector, no client-side filtering.
+ *
+ *   auth.uid() → admins/{uid}.clientId → clients/{clientId}
+ *
+ * The dashboard reads exactly ONE client document, resolved by AuthContext
+ * from the ownership field. Every query below is scoped to that clientId.
+ */
+function OwnStoreDashboard({ actor, params }: { actor: Actor; params: DashParams }) {
+  const { storeId } = useAuth();
   const range = params.range === "7" || params.range === "90" ? Number(params.range) : 30;
+  const storeLoad = useLoad(() => clientService.get(storeId!), [storeId], Boolean(storeId));
 
+  if (!storeId) {
+    return (
+      <ErrorState message="Your admin account has no store yet. Complete store setup first." action={<LinkButton href="/admin/setup">Open store setup</LinkButton>} />
+    );
+  }
+  if (storeLoad.loading && !storeLoad.data) {
+    return (
+      <div className="space-y-4">
+        <Skeleton className="h-28 w-full" />
+        <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+          {Array.from({ length: 8 }).map((_, i) => (
+            <Skeleton key={i} className="h-24" />
+          ))}
+        </div>
+      </div>
+    );
+  }
+  if (!storeLoad.data) {
+    return <ErrorState message={storeLoad.error ?? "Your store document was not found in Firestore."} />;
+  }
+  return (
+    <DashboardBody
+      actor={actor}
+      client={storeLoad.data.client}
+      range={range}
+      rangeHref={(r) => `/admin?range=${r}`}
+    />
+  );
+}
+
+/**
+ * SUPER_ADMIN keeps the platform-level view (multiple stores + selector).
+ * This is the existing Super Admin architecture and is never exposed to
+ * normal admins.
+ */
+function SuperAdminDashboard({ actor, params }: { actor: Actor; params: DashParams }) {
+  const { allowedClientIds } = useAuth();
+  const range = params.range === "7" || params.range === "90" ? Number(params.range) : 30;
   const clientsLoad = useLoad(() => clientService.listAllowed(allowedClientIds), [allowedClientIds]);
   const clients = useMemo(() => clientsLoad.data ?? [], [clientsLoad.data]);
-  // ONE ADMIN = ONE STORE: normal admins always land on their own store.
-  // SUPER_ADMIN keeps the platform-level store selector.
-  const active = isSuper
-    ? (clients.find((c) => c.id === params.client) ?? clients[0] ?? null)
-    : (clients.find((c) => c.id === primaryStoreId) ?? clients[0] ?? null);
-
-  const dataLoad = useLoad(
-    async () => {
-      if (!active) return null;
-      const [stats, series, items, reviews, recent, settings] = await Promise.all([
-        clientService.stats(active.id),
-        metricsService.series(active.id, range),
-        menuService.items(active.id),
-        reviewService.list(active.id),
-        activityService.forClient(active.id),
-        clientService.get(active.id).then((r) => r?.settings ?? null),
-      ]);
-      return { stats, series, items, reviews, recent: recent.slice(0, 6), settings };
-    },
-    [active?.id, range],
-    Boolean(active),
-  );
+  const active = clients.find((c) => c.id === params.client) ?? clients[0] ?? null;
 
   if (clientsLoad.loading) {
     return (
@@ -98,44 +132,96 @@ function Dashboard({
   if (!clients.length) {
     return (
       <EmptyState
-        title="Set up your store"
-        body="Create your store profile, branding, menu, loyalty program, QR experience and customer settings. This is done once — afterwards you land straight on your dashboard."
+        title="No stores on the platform yet"
+        body="Create the first store, or seed the demo workspace to explore the console."
         icon={<Building2 className="size-5" />}
         action={
           <div className="flex flex-wrap justify-center gap-2">
             <LinkButton href="/admin/clients/new">Set Up Store</LinkButton>
-            {isSuper ? (
-              <button
-                className="rounded-xl border border-espresso/25 px-4 py-2.5 text-[13px] font-semibold text-espresso hover:bg-linen/50"
-                onClick={() => runOp(() => seedDemoClients(actor), opToast(clientsLoad.reload), "Demo store created")}
-              >
-                Use Demo Store
-              </button>
-            ) : null}
+            <button
+              className="rounded-xl border border-espresso/25 px-4 py-2.5 text-[13px] font-semibold text-espresso hover:bg-linen/50"
+              onClick={() => runOp(() => seedDemoClients(actor), opToast(clientsLoad.reload), "Demo store created")}
+            >
+              Use Demo Store
+            </button>
           </div>
         }
       />
     );
   }
 
+  if (!active) return <ErrorState message="Select a store to view its dashboard." />;
+
+  return (
+    <DashboardBody
+      actor={actor}
+      client={active}
+      range={range}
+      rangeHref={(r) => `/admin?client=${active.id}&range=${r}`}
+      storeSelector={clients.map((c) => (
+        <Link
+          key={c.id}
+          href={`/admin?client=${c.id}&range=${range}`}
+          className={`rounded-full px-3 py-1.5 text-[11px] font-bold transition-colors ${
+            c.id === active.id ? "bg-cream text-espresso" : "bg-cream/10 text-cream/70 hover:bg-cream/20"
+          }`}
+        >
+          {c.displayName}
+        </Link>
+      ))}
+    />
+  );
+}
+
+/** Shared dashboard body — every query is scoped to a single clientId. */
+function DashboardBody({
+  actor,
+  client,
+  range,
+  rangeHref,
+  storeSelector,
+}: {
+  actor: Actor;
+  client: ClientDoc;
+  range: number;
+  rangeHref: (range: string) => string;
+  /** SUPER_ADMIN only — normal admins never receive a store selector. */
+  storeSelector?: React.ReactNode;
+}) {
+  const active = client;
+  const dataLoad = useLoad(
+    async () => {
+      const [stats, series, items, reviews, recent, settings] = await Promise.all([
+        clientService.stats(active.id),
+        metricsService.series(active.id, range),
+        menuService.items(active.id),
+        reviewService.list(active.id),
+        activityService.forClient(active.id),
+        clientService.get(active.id).then((r) => r?.settings ?? null),
+      ]);
+      return { stats, series, items, reviews, recent: recent.slice(0, 6), settings };
+    },
+    [active.id, range],
+  );
+
   const d = dataLoad.data;
   const stats = d?.stats;
   const tiles = [
-    { label: "Total Customers", value: stats?.customers ?? "…", icon: <Users className="size-4" />, wide: true, href: `/admin/clients/${active!.id}/customers` },
-    { label: "Active Staff", value: stats?.staff ?? "…", icon: <Users className="size-4" />, href: `/admin/clients/${active!.id}/staff` },
-    { label: "Menu Items", value: stats?.menu ?? "…", icon: <UtensilsCrossed className="size-4" />, href: `/admin/clients/${active!.id}/menu` },
-    { label: "QR Scans", value: stats?.qrScans?.toLocaleString("en-IN") ?? "…", icon: <QrCode className="size-4" />, href: `/admin/clients/${active!.id}/qr` },
-    { label: "Google Reviews", value: stats?.googleReviews ?? "…", icon: <Star className="size-4" />, href: `/admin/clients/${active!.id}/reviews` },
-    { label: "AI Reviews", value: stats?.aiReviews ?? "…", icon: <Sparkles className="size-4" />, href: `/admin/clients/${active!.id}/ai-review` },
-    { label: "Stamps", value: stats?.stamps ?? "…", icon: <Activity className="size-4" />, href: `/admin/clients/${active!.id}/customers` },
-    { label: "Rewards Redeemed", value: stats?.rewards ?? "…", icon: <BadgePercent className="size-4" />, href: `/admin/clients/${active!.id}/loyalty` },
+    { label: "Total Customers", value: stats?.customers ?? "…", icon: <Users className="size-4" />, wide: true, href: `/admin/clients/${active.id}/customers` },
+    { label: "Active Staff", value: stats?.staff ?? "…", icon: <Users className="size-4" />, href: `/admin/clients/${active.id}/staff` },
+    { label: "Menu Items", value: stats?.menu ?? "…", icon: <UtensilsCrossed className="size-4" />, href: `/admin/clients/${active.id}/menu` },
+    { label: "QR Scans", value: stats?.qrScans?.toLocaleString("en-IN") ?? "…", icon: <QrCode className="size-4" />, href: `/admin/clients/${active.id}/qr` },
+    { label: "Google Reviews", value: stats?.googleReviews ?? "…", icon: <Star className="size-4" />, href: `/admin/clients/${active.id}/reviews` },
+    { label: "AI Reviews", value: stats?.aiReviews ?? "…", icon: <Sparkles className="size-4" />, href: `/admin/clients/${active.id}/ai-review` },
+    { label: "Stamps", value: stats?.stamps ?? "…", icon: <Activity className="size-4" />, href: `/admin/clients/${active.id}/customers` },
+    { label: "Rewards Redeemed", value: stats?.rewards ?? "…", icon: <BadgePercent className="size-4" />, href: `/admin/clients/${active.id}/loyalty` },
   ];
 
   const quickActions = [
-    { href: `/admin/clients/${active!.id}/menu`, label: "Manage Menu", icon: <UtensilsCrossed className="size-4" /> },
-    { href: `/admin/clients/${active!.id}/staff`, label: "Manage Staff", icon: <Users className="size-4" /> },
-    { href: `/admin/clients/${active!.id}/loyalty`, label: "Loyalty Settings", icon: <BadgePercent className="size-4" /> },
-    { href: `/admin/clients/${active!.id}/qr`, label: "Generate QR Code", icon: <QrCode className="size-4" /> },
+    { href: `/admin/clients/${active.id}/menu`, label: "Manage Menu", icon: <UtensilsCrossed className="size-4" /> },
+    { href: `/admin/clients/${active.id}/staff`, label: "Manage Staff", icon: <Users className="size-4" /> },
+    { href: `/admin/clients/${active.id}/loyalty`, label: "Loyalty Settings", icon: <BadgePercent className="size-4" /> },
+    { href: `/admin/clients/${active.id}/qr`, label: "Generate QR Code", icon: <QrCode className="size-4" /> },
   ];
 
   const scanSeries = (d?.series ?? []).slice(-14);
@@ -149,35 +235,35 @@ function Dashboard({
       <div className="settle -mx-4 mb-6 bg-espresso px-4 py-5 text-cream md:-mx-8 md:px-8">
         <div className="mx-auto flex max-w-[1180px] flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
           <div>
-            <p className="label-caps !text-cream/50">Live workspace · /{active!.slug} · Firebase cafe-review7</p>
-            <h1 className="display-num mt-1 text-[clamp(28px,5vw,44px)] leading-none">{active!.displayName}</h1>
+            <p className="label-caps !text-cream/50">Live workspace · /{active.slug} · Firebase cafe-review7</p>
+            <h1 className="display-num mt-1 text-[clamp(28px,5vw,44px)] leading-none">{active.displayName}</h1>
             <p className="mt-1.5 text-[12.5px] text-cream/70">Welcome back, {actor.name.split(" ")[0]}. Here’s your overview.</p>
           </div>
-          <div className="flex flex-wrap gap-1.5">
-            {(isSuper ? clients : []).map((c) => (
-              <Link
-                key={c.id}
-                href={`/admin?client=${c.id}&range=${range}`}
-                className={`rounded-full px-3 py-1.5 text-[11px] font-bold transition-colors ${
-                  c.id === active!.id ? "bg-cream text-espresso" : "bg-cream/10 text-cream/70 hover:bg-cream/20"
-                }`}
-              >
-                {c.displayName}
-              </Link>
-            ))}
-          </div>
+          {storeSelector ? <div className="flex flex-wrap gap-1.5">{storeSelector}</div> : null}
         </div>
       </div>
 
       <div className="mx-auto max-w-[1180px]">
+        {active.status === "DRAFT" ? (
+          <Card className="mb-5 flex flex-col gap-3 border-gold/40 bg-gold/10 p-4 sm:flex-row sm:items-center sm:justify-between">
+            <p className="text-[12.5px] text-[#8a5f10]">
+              <span className="font-bold">Your store is still a draft.</span> Finish the remaining setup fields and publish —
+              your customers can’t see it yet.
+            </p>
+            <LinkButton href={`/admin/clients/${active.id}/setup`} size="sm">
+              <Rocket className="size-3.5" /> Finish setup
+            </LinkButton>
+          </Card>
+        ) : null}
+
         <PageHeader
           eyebrow="Store overview"
-          title={`${active!.businessName} — ${range} days`}
-          subtitle={active!.tagline}
+          title={`${active.businessName} — ${range} days`}
+          subtitle={active.tagline}
           actions={
             <>
               {(["7", "30", "90"] as const).map((r) => (
-                <LinkButton key={r} href={`/admin?client=${active!.id}&range=${r}`} size="sm" variant={String(range) === r ? "primary" : "outline"}>
+                <LinkButton key={r} href={rangeHref(r)} size="sm" variant={String(range) === r ? "primary" : "outline"}>
                   {r} days
                 </LinkButton>
               ))}
@@ -227,7 +313,7 @@ function Dashboard({
             </Card>
 
             <Card className="p-5">
-              <SectionTitle right={<LinkButton href={`/admin/clients/${active!.id}/activity`} size="sm" variant="ghost">All</LinkButton>}>
+              <SectionTitle right={<LinkButton href={`/admin/clients/${active.id}/activity`} size="sm" variant="ghost">All</LinkButton>}>
                 Recent activity
               </SectionTitle>
               {(d?.recent ?? []).length ? (

@@ -1,74 +1,49 @@
 "use client";
 
-import { use } from "react";
+import { useEffect } from "react";
+import { useRouter } from "next/navigation";
 import { WorkspacePage } from "@/components/admin-page";
-import { useAuth } from "@/context/AuthContext";
-import { LinkButton } from "@/components/ui";
-import { ErrorState, PageHeader, SkeletonRows } from "@/components/ui";
+import { SETUP_PATH } from "@/context/AuthContext";
+import { PageHeader, SkeletonRows } from "@/components/ui";
 import { StoreSetupWizard } from "@/components/client-wizard";
-import { clientService, type StoreFormData } from "@/lib/firebase/services";
-import { useLoad } from "@/lib/use-load";
 import type { Actor } from "@/lib/firebase/types";
 
-export default function StoreSetupPage({ searchParams }: { searchParams: Promise<{ draft?: string }> }) {
-  const { draft } = use(searchParams);
-  return (
-    <WorkspacePage>
-      {({ actor, role }) => (
-        <>
-          <PageHeader
-            eyebrow="Store Setup"
-            title={draft ? "Resume Store Setup" : "Set Up Store"}
-            subtitle="Business, branding, theme, menu, Google Reviews, social, Wi-Fi, loyalty and AI — save a draft any time, publish when ready."
-          />
-          <SetupGate actor={actor} role={role} draft={draft}>
-          {role === "MANAGER" && !draft ? (
-            <ErrorState message="Managers cannot create new stores. Ask a Super Admin or Client Admin to set up the store — you can manage existing assigned stores from the Stores list." />
-          ) : draft ? (
-            <ResumeDraft actor={actor} draftId={draft} />
-          ) : (
-            <StoreSetupWizard actor={actor} />
-          )}
-          </SetupGate>
-        </>
-      )}
-    </WorkspacePage>
-  );
-}
-
-function ResumeDraft({ actor, draftId }: { actor: Actor; draftId: string }) {
-  const load = useLoad(() => clientService.loadDraft(draftId), [draftId]);
-  if (load.loading && !load.data) return <SkeletonRows rows={4} />;
-  if (load.error && !load.data) return <ErrorState message={load.error} />;
-  if (!load.data) return <ErrorState message={`Draft ${draftId} was not found in Firestore.`} />;
-  const { status: _status, ...form } = load.data;
-  return <StoreSetupWizard actor={actor} initialDraft={form as StoreFormData} initialStoreId={draftId} />;
-}
-
 /**
- * ONE ADMIN = ONE STORE. A normal admin who already owns a store cannot open a
- * second setup wizard — they are pointed at their existing store instead.
- * Resuming their own draft is still allowed.
+ * PLATFORM store creation — SUPER_ADMIN only.
+ *
+ * A normal admin creates their ONE store through first-time setup
+ * (/admin/setup), so they are redirected there instead. There is no
+ * "add another store" path for them anywhere in the console.
  */
-function SetupGate({
-  actor,
-  role,
-  draft,
-  children,
-}: {
-  actor: Actor;
-  role: string;
-  draft?: string;
-  children: React.ReactNode;
-}) {
-  const { primaryStoreId } = useAuth();
-  void actor;
-  const locked = role !== "SUPER_ADMIN" && Boolean(primaryStoreId) && draft !== primaryStoreId;
-  if (!locked) return <>{children}</>;
+export default function StoreSetupPage() {
+  return <WorkspacePage>{({ actor, role }) => <PlatformStoreSetup actor={actor} role={role} />}</WorkspacePage>;
+}
+
+function PlatformStoreSetup({ actor, role }: { actor: Actor; role: string }) {
+  const router = useRouter();
+  const isSuper = role === "SUPER_ADMIN";
+
+  useEffect(() => {
+    if (!isSuper) router.replace(SETUP_PATH);
+  }, [isSuper, router]);
+
+  if (!isSuper) {
+    return (
+      <div className="space-y-4">
+        <SkeletonRows rows={3} />
+        <p className="label-caps">Single-store admins set up their own store — opening setup…</p>
+      </div>
+    );
+  }
+
   return (
-    <ErrorState
-      message="Store Setup is already complete for this account — each admin manages exactly one store."
-      action={<LinkButton href={`/admin/clients/${primaryStoreId}`}>Open my store</LinkButton>}
-    />
+    <>
+      <PageHeader
+        eyebrow="Platform Store Setup"
+        title="Set Up Store"
+        subtitle="Business, branding, theme, menu, Google Reviews, social, Wi-Fi, loyalty and AI — save a draft any time, publish when ready."
+      />
+      <StoreSetupWizard actor={actor} />
+    </>
   );
 }

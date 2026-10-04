@@ -1,4 +1,4 @@
-// Sidebar/navigation stability verifier — Phase 7.
+// Sidebar/navigation stability verifier — Phase 7 + single-store navigation.
 // Run with: node scripts/verify-navigation.mjs
 import { readFileSync } from "fs";
 
@@ -16,7 +16,7 @@ for (const label of EXPECTED) check(`label present in canonical nav: "${label}"`
 
 // 2. every item has stable id + route
 const items = [...shell.matchAll(/\{ id: "([a-z-]+)", href: ([^,]+), label: "([^"]+)"/g)];
-check("16 nav items with id + href + label", items.length === 16);
+check("16 literal nav items with id + href + label", items.length === 16);
 check("ids unique", new Set(items.map((m) => m[1])).size === items.length);
 
 // 3. RailLink never hides the label behind breakpoint/opacity/hover/sr-only
@@ -36,11 +36,38 @@ check("footer pinned (shrink-0)", aside.includes("shrink-0 border-t"));
 check("content offset matches rail widths", shell.includes("md:pl-[232px] lg:pl-[248px]") && aside.includes("w-[232px]") && aside.includes("lg:w-[248px]"));
 
 // 5. store section never depends on Firebase data having loaded
-check("store context derived from route", shell.includes("function storeIdFromPath") && shell.includes("client?.id ?? routeStoreId"));
-check("drawer uses same canonical nav", (shell.match(/GLOBAL_NAV\.map/g) || []).length >= 2);
+check("store context derived from route + owned store", shell.includes("function storeIdFromPath") && shell.includes("client?.id ?? routeStoreId"));
+check("drawer uses same canonical nav", (shell.match(/nav\.map\(/g) || []).length >= 2);
 check("no data-driven label", !/label: client\.|label: \{client/.test(shell));
 check("active state handles nested routes", shell.includes("function isActivePath"));
 check("aria-current on active", shell.includes('aria-current={active ? "page" : undefined}'));
 
-console.log(failures ? `\n${failures} check(s) FAILED` : "\nNavigation stability verified.");
+// 6. ONE ADMIN = ONE STORE — normal admins have no Stores navigation
+const baseNav = shell.slice(shell.indexOf("export const BASE_NAV"), shell.indexOf("export const SUPER_ADMIN_NAV"));
+const superNav = shell.slice(shell.indexOf("export const SUPER_ADMIN_NAV"), shell.indexOf("export const globalNavFor"));
+const globalNavFor = shell.slice(shell.indexOf("export const globalNavFor"), shell.indexOf("export const STORE_NAV_LABELS"));
+check("normal-admin nav (BASE_NAV) has no Stores item", !baseNav.includes('label: "Stores"') && !baseNav.includes("/admin/clients"));
+check("SUPER_ADMIN nav keeps the platform Stores list", superNav.includes('label: "Stores"') && superNav.includes('href: "/admin/clients"'));
+check("globalNavFor gates Stores on SUPER_ADMIN", globalNavFor.includes('role === "SUPER_ADMIN" ? SUPER_ADMIN_NAV : BASE_NAV'));
+check("normal admins always get their single store's nav", shell.includes("client?.id ?? routeStoreId ?? storeId ?? null"));
+
+// 7. mobile bottom navigation: Home / Menu / Guests / QR / More, and NO Stores tab for normal admins
+const bottom = shell.slice(shell.indexOf("mobile bottom navigation"), shell.indexOf("<ToastFromQuery />"));
+check("bottom nav has Home/Menu/Guests/QR + More", ["Home", "Menu", "Guests", "QR"].every((l) => bottom.includes(`label: "${l}"`)) && /\bMore\b/.test(bottom));
+const afterSuper = bottom.slice(bottom.indexOf(": isSuper"));
+const superBranch = afterSuper.slice(0, afterSuper.indexOf(": ["));
+const normalBranch = afterSuper.slice(afterSuper.indexOf(": ["));
+const storeBranch = bottom.slice(0, bottom.indexOf(": isSuper"));
+check(
+  "Stores tab only inside the SUPER_ADMIN branch",
+  superBranch.includes('label: "Stores"') && !normalBranch.includes('label: "Stores"') && !storeBranch.includes('label: "Stores"'),
+);
+check("bottom nav keeps safe-area padding", bottom.includes("pb-[env(safe-area-inset-bottom)]"));
+
+// 8. header: informational store name only — no store selector
+check("header renders the current store name (no selector)", shell.includes("headerStore") && !/<select[^>]*store/i.test(shell));
+check("search store-group is SUPER_ADMIN-only", shell.includes("includeStores: isSuperAdmin"));
+check("header status badge is informational", shell.includes("headerStore.status !== \"ACTIVE\""));
+
+console.log(failures ? `\n${failures} check(s) FAILED` : "\nNavigation stability + single-store nav verified.");
 process.exit(failures ? 1 : 0);

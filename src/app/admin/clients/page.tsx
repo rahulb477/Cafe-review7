@@ -1,6 +1,7 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import { Building2, ExternalLink, QrCode, Users } from "lucide-react";
 import { WorkspacePage, opToast } from "@/components/admin-page";
 import { useAuth } from "@/context/AuthContext";
@@ -20,16 +21,34 @@ import { clientService } from "@/lib/firebase/services";
 import type { Actor, ClientDoc } from "@/lib/firebase/types";
 import { runOp, useLoad } from "@/lib/use-load";
 
+/**
+ * PLATFORM-LEVEL Stores list — SUPER_ADMIN only.
+ *
+ * Normal admins own exactly ONE store, so this page is not part of their
+ * experience: they are redirected to their dashboard (and /stores, the alias,
+ * does the same). Store management for a normal admin happens inside their
+ * own store pages (clientId is always their own).
+ */
 export default function ClientsPage() {
   return <WorkspacePage>{({ actor, role }) => <Clients actor={actor} role={role} />}</WorkspacePage>;
 }
 
 function Clients({ actor, role }: { actor: Actor; role: string }) {
-  const { allowedClientIds, primaryStoreId } = useAuth();
-  const canSetUp = role === "SUPER_ADMIN" || (role === "CLIENT_ADMIN" && !primaryStoreId);
+  const router = useRouter();
+  const { allowedClientIds } = useAuth();
+  const isSuper = role === "SUPER_ADMIN";
   const [q, setQ] = useState("");
   const [status, setStatus] = useState("ALL");
-  const { loading, error, data, reload } = useLoad(() => clientService.listAllowed(allowedClientIds), [allowedClientIds]);
+
+  // A normal admin can never browse the platform store list.
+  useEffect(() => {
+    if (!isSuper) router.replace("/admin");
+  }, [isSuper, router]);
+
+  const { loading, error, data, reload } = useLoad(
+    () => (isSuper ? clientService.listAllowed(allowedClientIds) : Promise.resolve([] as ClientDoc[])),
+    [allowedClientIds, isSuper],
+  );
 
   const rows = useMemo(() => {
     const needle = q.trim().toLowerCase();
@@ -40,13 +59,22 @@ function Clients({ actor, role }: { actor: Actor; role: string }) {
     );
   }, [data, q, status]);
 
+  if (!isSuper) {
+    return (
+      <div className="space-y-4">
+        <SkeletonRows rows={3} />
+        <p className="label-caps">Stores are not listed for single-store admins — opening your dashboard…</p>
+      </div>
+    );
+  }
+
   return (
     <>
       <PageHeader
-        eyebrow={role === "SUPER_ADMIN" ? `${data?.length ?? 0} stores on the platform` : "Your store"}
-        title={role === "SUPER_ADMIN" ? "Stores" : "My Store"}
-        subtitle="Every store on the platform. Each store is fully isolated."
-        actions={canSetUp ? <LinkButton href="/admin/clients/new">Set Up Store</LinkButton> : undefined}
+        eyebrow={`${data?.length ?? 0} stores on the platform`}
+        title="Stores"
+        subtitle="Platform-level view. Each store is fully isolated; normal admins only ever see their own."
+        actions={<LinkButton href="/admin/clients/new">Set Up Store</LinkButton>}
       />
 
       <div className="mb-4 flex flex-wrap items-center gap-2">
@@ -73,7 +101,7 @@ function Clients({ actor, role }: { actor: Actor; role: string }) {
           title="No stores match"
           body="Adjust your filters, or set up a new store to get started."
           icon={<Building2 className="size-5" />}
-          action={canSetUp ? <LinkButton href="/admin/clients/new">Set Up Store</LinkButton> : undefined}
+          action={<LinkButton href="/admin/clients/new">Set Up Store</LinkButton>}
         />
       ) : (
         <div className="space-y-3">
@@ -88,7 +116,7 @@ function Clients({ actor, role }: { actor: Actor; role: string }) {
                   </div>
                   <Badge tone={c.status === "ACTIVE" || c.status === "PUBLISHED" ? "green" : c.status === "DRAFT" ? "gold" : c.status === "SUSPENDED" ? "red" : "neutral"}>{c.status}</Badge>
                 </div>
-                <RowActions client={c} actor={actor} role={role} reload={reload} />
+                <RowActions client={c} actor={actor} reload={reload} />
               </div>
             </Card>
           ))}
@@ -98,11 +126,11 @@ function Clients({ actor, role }: { actor: Actor; role: string }) {
   );
 }
 
-function RowActions({ client, actor, role, reload }: { client: ClientDoc; actor: Actor; role: string; reload: () => void }) {
+function RowActions({ client, actor, reload }: { client: ClientDoc; actor: Actor; reload: () => void }) {
   if (client.status === "DRAFT") {
     return (
       <div className="flex flex-wrap gap-1.5">
-        <LinkButton href={`/admin/clients/new?draft=${client.id}`} size="sm">
+        <LinkButton href={`/admin/clients/${client.id}/setup`} size="sm">
           Resume Setup
         </LinkButton>
         <LinkButton href={`/admin/clients/${client.id}`} size="sm" variant="outline">
@@ -128,21 +156,19 @@ function RowActions({ client, actor, role, reload }: { client: ClientDoc; actor:
       <LinkButton href={`/staff/${client.slug}`} size="sm" variant="quiet" external>
         <Users className="size-3.5" /> Staff
       </LinkButton>
-      {role === "SUPER_ADMIN" ? (
-        <Button
-          size="sm"
-          variant={client.status === "SUSPENDED" ? "outline" : "danger"}
-          onClick={() =>
-            runOp(
-              () => clientService.setStatus(actor, client.id, client.status === "SUSPENDED" ? "PUBLISHED" : "SUSPENDED"),
-              opToast(reload),
-              client.status === "SUSPENDED" ? "Store reactivated" : "Store suspended",
-            )
-          }
-        >
-          {client.status === "SUSPENDED" ? "Activate" : "Suspend"}
-        </Button>
-      ) : null}
+      <Button
+        size="sm"
+        variant={client.status === "SUSPENDED" ? "outline" : "danger"}
+        onClick={() =>
+          runOp(
+            () => clientService.setStatus(actor, client.id, client.status === "SUSPENDED" ? "PUBLISHED" : "SUSPENDED"),
+            opToast(reload),
+            client.status === "SUSPENDED" ? "Store reactivated" : "Store suspended",
+          )
+        }
+      >
+        {client.status === "SUSPENDED" ? "Activate" : "Suspend"}
+      </Button>
     </div>
   );
 }
