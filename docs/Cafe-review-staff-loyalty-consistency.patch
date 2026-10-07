@@ -1,0 +1,1226 @@
+diff --git a/firestore.rules b/firestore.rules
+index 51ae7a4..549f380 100644
+--- a/firestore.rules
++++ b/firestore.rules
+@@ -1,29 +1,30 @@
+ rules_version = '2';
+ 
+ // ============================================================================
+-// Cafe Review — Firestore Security Rules for project `cafe-review7`
++// Cafe Review — CANONICAL Firestore Security Rules for project `cafe-review7`
+ //
+ // ONE Firestore database serves the Customer App, the Admin App and the Staff
+-// App. This file is therefore the PROJECT ruleset, not a staff-only fragment.
+-// It preserves the canonical collection layout and public customer reads while
+-// adding Staff App notification, cooldown, and atomic-ledger validation:
++// App, so this file is the PROJECT ruleset — not an app-specific fragment.
++// All three repositories ship this exact file (verified by
++// scripts/verify-rules-parity.mjs in the admin repo) so there is exactly one
++// loyalty authorization model:
+ //
+-//   + clients/{clientId}/notifications/{notificationId}
+-//       staff read their own business's notifications, append schema-valid
+-//       events for that same business, and may only flip `read`.
++//   Auth UID -> staffUsers/{uid} -> clientId -> clients/{clientId}
++//   customers/{uid} -> loyaltyAccounts/{uid} -> clients/{id}/stampTransactions
+ //
+-//   + activityLogs / metricsDaily (admin audit and analytics collections).
++// Loyalty invariants enforced HERE (never in a frontend):
++//   * 12-hour stamp cooldown with the server clock (request.time >= lastStampAt
++//     + duration.value(12, 'h')) on both the ledger row and the balance.
++//   * one stamp = one immutable ledger row, one visit, one balance step,
++//     one notification, created in the same commit (getAfter() validated).
++//   * lifetimeStamps is monotonic: it can only grow, never reset on redemption.
++//   * customers can read their own loyalty, never write it.
++//   * no recursive admin write grant: config writes are scoped to the admin's
++//     own store (canManage), while customer/loyalty/stamp writes must pass the
++//     collection-specific validation below.
+ //
+-// Admin reads remain broad for operational visibility. There is no recursive
+-// admin write grant: client/staff/menu/reward/QR configuration writes are
+-// explicitly admin-authorized, while customer, visit, loyalty, stamp, and
+-// redemption writes must pass their collection-specific validation below.
+-// Review the admin workflows before publishing these intentionally narrower
+-// write permissions. The staff authorization chain is never browser supplied:
+-// Auth UID -> staffUsers/{uid} -> clientId -> clients/{clientId}.
+-//
+-// Deploy from this repository with:
+-//   npx firebase-tools deploy --only firestore:rules,firestore:indexes --project cafe-review7
++// Deploy from any of the three repositories with:
++//   npx firebase-tools deploy --only firestore:rules --project cafe-review7
+ // ============================================================================
+ 
+ service cloud.firestore {
+@@ -112,6 +113,30 @@ service cloud.firestore {
+           : '';
+     }
+ 
++    // ---------------------------------------------------------------- admin governance
++    // ONE ADMIN = ONE STORE: client/menu/config writes are scoped to the
++    // admin's own business; only a super admin manages every store.
++    function adminDoc() {
++      return get(/databases/$(database)/documents/admins/$(uid()));
++    }
++
++    function isSuperAdmin() {
++      return isActiveAdmin()
++        && (adminDoc().data.get('role', '') == 'SUPER_ADMIN'
++            || uid() == '4T2KTiZiAAYKxJ2FlIXSBsOj6G93');
++    }
++
++    function canManage(clientId) {
++      return isSuperAdmin()
++        || (isActiveAdmin()
++            && (adminDoc().data.get('clientId', '') == clientId
++                || clientId in adminDoc().data.get('clientIds', [])));
++    }
++
++    function unchanged(field) {
++      return request.resource.data[field] == resource.data[field];
++    }
++
+     function isStaffOf(clientId) {
+       return signedIn()
+         && clientId is string
+@@ -339,6 +364,25 @@ service cloud.firestore {
+         );
+     }
+ 
++    /** [{ id, name }] records of REAL selected menu items (Customer App). */
++    function itemRecords(v, maxItems) {
++      return v is list
++        && v.size() <= maxItems
++        && (
++          v.size() == 0
++          || (
++            v[0] is map
++            && v[0].keys().hasOnly(['id', 'name'])
++            && v[0].get('id', null) is string
++            && v[0].get('id', '').size() > 0
++            && v[0].get('id', '').size() <= 128
++            && v[0].get('name', null) is string
++            && v[0].get('name', '').size() > 0
++            && v[0].get('name', '').size() <= 80
++          )
++        );
++    }
++
+     function strList(v, maxItems, maxLen) {
+       return v is list
+         && v.size() <= maxItems
+@@ -408,8 +452,19 @@ service cloud.firestore {
+     // ============================================================
+ 
+     match /admins/{adminId} {
+-      allow get: if signedIn() && uid() == adminId;
+-      allow create, update, delete: if isActiveAdmin();
++      allow get: if signedIn() && (uid() == adminId || isSuperAdmin());
++      // Bootstrap: the platform super admin may create only their own document.
++      allow create: if isSuperAdmin()
++        || (uid() == adminId && adminId == '4T2KTiZiAAYKxJ2FlIXSBsOj6G93');
++      // Self-update may only claim a primary store ONCE (null -> id) and touch
++      // bookkeeping; role/status stay frozen for non-super admins.
++      allow update: if isSuperAdmin()
++        || (uid() == adminId
++            && request.resource.data.get('role', '') == resource.data.get('role', '')
++            && request.resource.data.get('status', '') == resource.data.get('status', '')
++            && (resource.data.get('clientId', null) == null
++                || request.resource.data.get('clientId', null) == resource.data.get('clientId', null)));
++      allow delete: if isSuperAdmin();
+     }
+ 
+     // ============================================================
+@@ -425,7 +480,11 @@ service cloud.firestore {
+ 
+       // Admins manage the staff registry explicitly; no recursive admin grant
+       // applies to customer/loyalty/stamp documents.
+-      allow create, update, delete: if isActiveAdmin();
++      // Scoped to the admin's own store; staff can never be re-homed silently.
++      allow create: if canManage(request.resource.data.get('clientId', ''));
++      allow update: if canManage(request.resource.data.get('clientId', ''))
++        && unchanged('clientId');
++      allow delete: if canManage(resource.data.get('clientId', ''));
+     }
+ 
+     // ============================================================
+@@ -445,9 +504,19 @@ service cloud.firestore {
+       allow list:
+         if resource.data.status == 'PUBLISHED';
+ 
+-      // Admins manage business metadata/configuration here. This does not grant
++      // Store creation: SUPER_ADMIN freely; a CLIENT_ADMIN exactly once, for
++      // themselves, as part of the atomic ownership-claim transaction.
++      allow create: if isSuperAdmin()
++        || (isActiveAdmin()
++            && adminDoc().data.get('role', '') == 'CLIENT_ADMIN'
++            && adminDoc().data.get('clientId', null) == null
++            && request.resource.data.get('ownerUid', '') == uid()
++            && request.resource.data.status == 'DRAFT');
++      // Config writes stay inside the admin's own store. This does not grant
+       // writes to nested stamps, visits, loyalty accounts, or notifications.
+-      allow create, update, delete: if isActiveAdmin();
++      allow update: if canManage(clientId)
++        && (!('ownerUid' in resource.data) || unchanged('ownerUid') || isSuperAdmin());
++      allow delete: if false; // never delete store history
+ 
+       // ----------------------------------------------------------
+       // MENU CATEGORIES
+@@ -457,7 +526,7 @@ service cloud.firestore {
+         allow read:
+           if clientIsPublic(clientId)
+           || isStaffOf(clientId);
+-        allow create, update, delete: if isActiveAdmin();
++        allow create, update, delete: if canManage(clientId);
+       }
+ 
+       // ----------------------------------------------------------
+@@ -468,7 +537,7 @@ service cloud.firestore {
+         allow read:
+           if clientIsPublic(clientId)
+           || isStaffOf(clientId);
+-        allow create, update, delete: if isActiveAdmin();
++        allow create, update, delete: if canManage(clientId);
+       }
+ 
+       // ----------------------------------------------------------
+@@ -479,7 +548,7 @@ service cloud.firestore {
+         allow read:
+           if clientIsPublic(clientId)
+           || isStaffOf(clientId);
+-        allow create, update, delete: if isActiveAdmin();
++        allow create, update, delete: if canManage(clientId);
+       }
+ 
+       // ----------------------------------------------------------
+@@ -489,7 +558,16 @@ service cloud.firestore {
+       match /qrConfigurations/{qrId} {
+         allow read:
+           if isStaffOf(clientId);
+-        allow create, update, delete: if isActiveAdmin();
++        allow create, update, delete: if canManage(clientId);
++      }
++
++      // ----------------------------------------------------------
++      // AI REVIEW USAGE (per client, per month) — admin add-on
++      // ----------------------------------------------------------
++      match /aiUsage/{month} {
++        allow read: if canManage(clientId);
++        allow create, update: if canManage(clientId);
++        allow delete: if false;
+       }
+ 
+       // ==========================================================
+@@ -942,10 +1020,18 @@ service cloud.firestore {
+           && request.resource.data.customerId == uid()
+           && request.resource.data.generatedReview is string
+           && request.resource.data.generatedReview.size() <= 4000
+-          && strList(
+-            request.resource.data.selectedItems,
+-            20,
+-            80
++          // Canonical: [{ id, name }] records of the REAL selected menu items.
++          // Legacy string lists stay valid so an older client keeps working.
++          && (
++            itemRecords(
++              request.resource.data.selectedItems,
++              20
++            )
++            || strList(
++              request.resource.data.selectedItems,
++              20,
++              80
++            )
+           )
+           && (
+             !('itemsTried' in request.resource.data)
+@@ -1978,7 +2064,8 @@ service cloud.firestore {
+     // ACTIVITY LOG — append-only audit trail (admin app)
+     // ============================================================
+     match /activityLogs/{id} {
+-      allow read: if isActiveAdmin();
++      allow read: if isSuperAdmin()
++        || (isActiveAdmin() && canManage(resource.data.get('clientId', '')));
+       allow create: if signedIn()
+         && request.resource.data.get('actorUid', '') == uid(); // an actor can only log as themselves
+       allow update, delete: if false;
+@@ -1988,7 +2075,8 @@ service cloud.firestore {
+     // ANALYTICS COUNTERS — blind daily counters (customer app)
+     // ============================================================
+     match /metricsDaily/{id} {
+-      allow read: if isActiveAdmin();
++      allow read: if isSuperAdmin()
++        || (isActiveAdmin() && canManage(resource.data.get('clientId', '')));
+       allow create, update: if request.resource.data.get('clientId', '') is string
+         && request.resource.data.clientId.size() > 0
+         && request.resource.data.clientId.size() < 64
+diff --git a/src/services/loyaltyCanonical.ts b/src/services/loyaltyCanonical.ts
+new file mode 100644
+index 0000000..c7ae025
+--- /dev/null
++++ b/src/services/loyaltyCanonical.ts
+@@ -0,0 +1,414 @@
++/**
++ * CANONICAL loyalty model for project `cafe-review7` (Admin App copy).
++ *
++ * The Customer App, the Staff App and the Admin App must agree on exactly this:
++ *
++ *   loyaltyAccounts/{customerId} =
++ *     { clientId, customerId, currentStamps, stamps, lifetimeStamps,
++ *       rewardsEarned, rewardsRedeemed, stampTarget, rewardName,
++ *       isEligibleForReward, lastStampAt, updatedAt }
++ *
++ *   * One successful normal stamp per customer per business every 12 hours:
++ *     nextStampAt = lastStampAt + 12h  (server-side authority: Firestore Rules
++ *     compare request.time >= lastStampAt + duration.value(12, 'h')).
++ *   * currentStamps resets by the reward configuration on redemption;
++ *     lifetimeStamps is monotonic and NEVER resets.
++ *
++ * The identical module is shipped to the other two apps so there is a single
++ * definition of the rule (verified by tests/loyalty-parity.test.mjs).
++ *
++ * Pure and dependency-free: safe in React, in Node scripts and in tests.
++ * Uses only erasable TypeScript syntax so `node --test` can load it directly.
++ */
++
++/** Normal staff stamps are separated by an exact 12-hour server-time window. */
++export const STAMP_COOLDOWN_HOURS = 12;
++export const STAMP_COOLDOWN_MS = STAMP_COOLDOWN_HOURS * 60 * 60 * 1000;
++
++const isFiniteNumber = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value);
++
++/** Non-negative integer or 0 (missing, strings, NaN, negatives → 0). Never NaN. */
++export function safeCount(value: unknown): number {
++  const n = typeof value === "string" && value.trim() !== "" ? Number(value) : value;
++  return isFiniteNumber(n) && n >= 0 ? Math.floor(n) : 0;
++}
++
++/**
++ * Any Firestore-ish date value → epoch milliseconds, or null.
++ * Supports Firestore Timestamp (toDate/toMillis), serialized
++ * { seconds, nanoseconds } / { _seconds, _nanoseconds }, Date, ISO strings,
++ * epoch seconds (< 1e11) and epoch milliseconds.
++ */
++export function toMillisSafe(value: unknown): number | null {
++  if (value === null || value === undefined || value === "") return null;
++
++  if (value instanceof Date) {
++    const ms = value.getTime();
++    return Number.isFinite(ms) ? ms : null;
++  }
++  if (typeof value === "number") return normalizeEpoch(value);
++  if (typeof value === "string") {
++    const trimmed = value.trim();
++    if (!trimmed) return null;
++    if (/^-?\d+$/.test(trimmed)) return normalizeEpoch(Number(trimmed));
++    const parsed = Date.parse(trimmed);
++    return Number.isFinite(parsed) ? parsed : null;
++  }
++  if (typeof value === "object") {
++    const v = value as {
++      toDate?: () => unknown;
++      toMillis?: () => unknown;
++      seconds?: number;
++      _seconds?: number;
++      nanoseconds?: number;
++      _nanoseconds?: number;
++    };
++    if (typeof v.toDate === "function") {
++      const d = v.toDate();
++      if (d instanceof Date && Number.isFinite(d.getTime())) return d.getTime();
++    }
++    if (typeof v.toMillis === "function") {
++      const ms = v.toMillis();
++      if (isFiniteNumber(ms)) return ms;
++    }
++    const seconds = isFiniteNumber(v.seconds) ? v.seconds : isFiniteNumber(v._seconds) ? v._seconds : null;
++    if (seconds !== null) {
++      const nanos = isFiniteNumber(v.nanoseconds) ? v.nanoseconds : isFiniteNumber(v._nanoseconds) ? v._nanoseconds : 0;
++      return normalizeEpoch(seconds * 1000 + Math.floor(nanos / 1e6));
++    }
++  }
++  return null;
++}
++
++function normalizeEpoch(value: number): number | null {
++  if (!Number.isFinite(value) || value <= 0) return null;
++  const ms = value < 1e11 ? value * 1000 : value;
++  return Number.isFinite(ms) ? ms : null;
++}
++
++export interface StampCooldown {
++  /** false when there is no usable lastStampAt (no recorded stamp yet). */
++  hasLastStamp: boolean;
++  lastStampAtMillis: number | null;
++  /** lastStampAt + 12h. */
++  nextStampAtMillis: number | null;
++  remainingMs: number;
++  /** true while the 12-hour window is still running. */
++  active: boolean;
++  /** true when a stamp may be awarded now (or none was ever recorded). */
++  eligible: boolean;
++  /** "8h 32m" while active, "" when eligible. */
++  remainingLabel: string;
++}
++
++/**
++ * The 12-hour rule, evaluated exactly like the Security Rules do
++ * (`request.time >= lastStampAt + duration.value(12, 'h')`).
++ * `nowMillis` is the server decision time when used to authorize a write; the
++ * browser clock is only ever used for display copy.
++ */
++export function computeStampCooldown(
++  lastStampAt: unknown,
++  nowMillis: number,
++): StampCooldown {
++  const now = Number.isFinite(nowMillis) ? nowMillis : Date.now();
++  const lastStampAtMillis = toMillisSafe(lastStampAt);
++  if (lastStampAtMillis === null) {
++    return {
++      hasLastStamp: false,
++      lastStampAtMillis: null,
++      nextStampAtMillis: null,
++      remainingMs: 0,
++      active: false,
++      eligible: true,
++      remainingLabel: "",
++    };
++  }
++  const nextStampAtMillis = lastStampAtMillis + STAMP_COOLDOWN_MS;
++  const remainingMs = Math.max(0, nextStampAtMillis - now);
++  return {
++    hasLastStamp: true,
++    lastStampAtMillis,
++    nextStampAtMillis,
++    remainingMs,
++    active: remainingMs > 0,
++    eligible: remainingMs === 0,
++    remainingLabel: remainingMs > 0 ? formatCooldownRemaining(remainingMs) : "",
++  };
++}
++
++/** Short informational copy; it never authorizes or schedules a stamp. */
++export function formatCooldownRemaining(remainingMs: number): string {
++  const safe = Number.isFinite(remainingMs) ? Math.max(0, remainingMs) : 0;
++  const totalMinutes = Math.ceil(safe / 60_000);
++  const hours = Math.floor(totalMinutes / 60);
++  const minutes = totalMinutes % 60;
++  if (hours > 0 && minutes > 0) return `${hours}h ${minutes}m`;
++  if (hours > 0) return `${hours}h`;
++  return `${minutes}m`;
++}
++
++/**
++ * True when an operation with this idempotency key was already applied.
++ * A pending (visitCounted === false) phase-one row is NOT a replay: it still
++ * has to be counted exactly once.
++ */
++export function isReplayedStamp(existingLedgerRow: unknown, transactionId: string): boolean {
++  const row = (existingLedgerRow ?? {}) as Record<string, unknown>;
++  if (!row || Object.keys(row).length === 0) return false;
++  const rowTransactionId = typeof row.transactionId === "string" ? row.transactionId : "";
++  return rowTransactionId === transactionId && row.visitCounted !== false;
++}
++
++export type StampGateCode = "OK" | "COOLDOWN" | "REPLAY" | "CROSS_BUSINESS" | "LOYALTY_DISABLED";
++
++export interface StampGateInput {
++  /** Business the write is happening in (from Auth UID → staffUsers/admin). */
++  clientId: string;
++  loyaltyEnabled: boolean;
++  /** customers/{customerId}.clientId — null when the document is missing. */
++  customerClientId: string | null;
++  /** loyaltyAccounts/{customerId}.clientId — null when no account exists yet. */
++  loyaltyClientId: string | null;
++  lastStampAt: unknown;
++  /** Server decision time (Firestore request.time) when authorizing a write. */
++  nowMillis: number;
++  transactionId: string;
++  /** Ledger row already stored under the same idempotency key, if any. */
++  existingLedgerRow?: unknown;
++}
++
++export interface StampGateDecision {
++  /** true only when a NEW stamp may be applied. */
++  allowed: boolean;
++  code: StampGateCode;
++  cooldown: StampCooldown;
++  message: string;
++}
++
++/**
++ * THE single pure definition of "may this stamp be applied?".
++ *
++ * It mirrors — line for line — what Firestore Rules evaluate in the commit:
++ *   1. idempotent retry of a counted transaction  → REPLAY (no new writes)
++ *   2. loyalty switched off for the business      → LOYALTY_DISABLED
++ *   3. customer/loyalty belongs to another store   → CROSS_BUSINESS
++ *   4. request.time >= lastStampAt + 12h           → COOLDOWN until then
++ *   5. otherwise                                   → OK (one stamp, one visit,
++ *                                                     one ledger row, one notification)
++ *
++ * Firestore `request.time` remains the only authority; this function exists so
++ * all three apps (Customer/Staff/Admin) and the contract tests agree on one rule.
++ */
++export function evaluateStampGate(input: StampGateInput): StampGateDecision {
++  const cooldown = computeStampCooldown(input.lastStampAt, input.nowMillis);
++
++  if (isReplayedStamp(input.existingLedgerRow, input.transactionId)) {
++    return {
++      allowed: false,
++      code: "REPLAY",
++      cooldown,
++      message: "This stamp operation was already applied — nothing is counted twice.",
++    };
++  }
++  if (!input.loyaltyEnabled) {
++    return { allowed: false, code: "LOYALTY_DISABLED", cooldown, message: "Loyalty is switched off for this business." };
++  }
++  if (input.customerClientId !== null && input.customerClientId !== input.clientId) {
++    return { allowed: false, code: "CROSS_BUSINESS", cooldown, message: "This guest belongs to another business." };
++  }
++  if (input.loyaltyClientId !== null && input.loyaltyClientId !== input.clientId) {
++    return { allowed: false, code: "CROSS_BUSINESS", cooldown, message: "This loyalty account belongs to another business." };
++  }
++  if (cooldown.active) {
++    return {
++      allowed: false,
++      code: "COOLDOWN",
++      cooldown,
++      message: `This guest already received a stamp. Next stamp available in ${cooldown.remainingLabel}.`,
++    };
++  }
++  return { allowed: true, code: "OK", cooldown, message: "Stamp may be applied." };
++}
++
++export interface LoyaltyLedgerCounts {
++  /** Counted stamp transactions (valid, immutable history). */
++  stampCount: number;
++  /** Reward redemptions recorded in the ledger. */
++  redemptionCount: number;
++  /** Ledger rows skipped as uncounted / malformed / redemption entries. */
++  skippedRows: number;
++}
++
++/** True when a ledger row is a counted stamp (never a redemption or pending row). */
++export function isCountedStampRow(data: unknown): boolean {
++  const row = (data ?? {}) as Record<string, unknown>;
++  const type = typeof row.type === "string" ? row.type : "";
++  if (type === "REWARD_REDEEMED" || type === "REWARD") return false;
++  if (row.visitCounted === false) return false;
++  if (type === "STAMP_ADDED") {
++    const delta = row.delta === undefined ? 1 : safeCount(row.delta);
++    return delta === 1;
++  }
++  if (type) return false;
++  // Untyped legacy rows count only when they are an explicit +1 stamp.
++  const delta = row.delta === undefined ? null : Number(row.delta);
++  return delta === 1;
++}
++
++/** counts + never NaN. */
++export function countLedgerRows(rows: readonly unknown[]): LoyaltyLedgerCounts {
++  let stampCount = 0;
++  let redemptionCount = 0;
++  let skippedRows = 0;
++  for (const row of rows) {
++    const data = (row ?? {}) as Record<string, unknown>;
++    const type = typeof data.type === "string" ? data.type : "";
++    if (type === "REWARD_REDEEMED" || type === "REWARD") {
++      redemptionCount += 1;
++      continue;
++    }
++    if (isCountedStampRow(data)) stampCount += 1;
++    else skippedRows += 1;
++  }
++  return { stampCount, redemptionCount, skippedRows };
++}
++
++/**
++ * lifetimeStamps must represent TOTAL stamps ever earned: it takes the largest
++ * trustworthy value (stored counter, ledger history, current balance) and can
++ * only ever grow. Never 0 while valid stamp history exists.
++ */
++export function reconcileLifetimeStamps(
++  currentStamps: unknown,
++  storedLifetimeStamps: unknown,
++  ledgerStampCount?: number,
++  rewardsRedeemed?: number,
++  stampTarget?: number,
++): number {
++  const redeemedFloor =
++    safeCount(rewardsRedeemed) * (safeCount(stampTarget) > 0 ? safeCount(stampTarget) : 0);
++  return Math.max(
++    safeCount(currentStamps),
++    safeCount(storedLifetimeStamps),
++    safeCount(ledgerStampCount),
++    safeCount(currentStamps) + redeemedFloor,
++  );
++}
++
++/**
++ * Canonical readers used by the admin UI — the only accepted way to show a
++ * balance, so a missing/legacy document can never render NaN/undefined.
++ */
++export function currentStampsOf(account: unknown): number {
++  const record = (account ?? {}) as Record<string, unknown>;
++  return safeCount(record.currentStamps ?? record.stamps);
++}
++
++export function lifetimeStampsOf(account: unknown, ledgerStampCount?: unknown): number {
++  const record = (account ?? {}) as Record<string, unknown>;
++  return reconcileLifetimeStamps(
++    currentStampsOf(record),
++    record.lifetimeStamps,
++    safeCount(ledgerStampCount),
++    safeCount(record.rewardsRedeemed),
++    safeCount(record.stampTarget),
++  );
++}
++
++export interface LoyaltyState {
++  /** Canonical balance (legacy alias `stamps` is accepted everywhere). */
++  currentStamps: number;
++  stamps?: number;
++  lifetimeStamps: number;
++  rewardsEarned: number;
++  rewardsRedeemed: number;
++  stampTarget: number;
++  lastStampAt: unknown;
++}
++
++export interface StampAwardPlan {
++  currentStamps: number;
++  lifetimeStamps: number;
++  rewardsEarned: number;
++  rewardUnlocked: boolean;
++  /** true when this stamp crosses (or repairs) the reward threshold. */
++  rewardJustUnlocked: boolean;
++}
++
++/**
++ * The single definition of "one successful stamp" — used by the Admin App and
++ * asserted by the contract tests shared with the Staff App:
++ *   currentStamps += 1, lifetimeStamps += 1, rewardsEarned updated on threshold.
++ */
++export function planStampAward(
++  account: Partial<LoyaltyState>,
++  ledgerStampCount?: number,
++): StampAwardPlan {
++  const target = safeCount(account.stampTarget);
++  const before = currentStampsOf(account);
++  const currentStamps = before + 1;
++  const rewardsRedeemed = safeCount(account.rewardsRedeemed);
++  const storedEarned = Math.max(safeCount(account.rewardsEarned), rewardsRedeemed);
++  const rewardJustUnlocked =
++    (before < target && currentStamps >= target) || (before >= target && storedEarned === rewardsRedeemed);
++  return {
++    currentStamps,
++    lifetimeStamps:
++      reconcileLifetimeStamps(before, account.lifetimeStamps, ledgerStampCount, rewardsRedeemed, target) + 1,
++    rewardsEarned: storedEarned + (rewardJustUnlocked ? 1 : 0),
++    rewardUnlocked: currentStamps >= target,
++    rewardJustUnlocked,
++  };
++}
++
++export interface RedemptionPlan {
++  currentStamps: number;
++  /** Always unchanged by a redemption. */
++  lifetimeStamps: number;
++  rewardsEarned: number;
++  rewardsRedeemed: number;
++}
++
++/**
++ * Redemption: currentStamps drops by the configured reward cost, lifetimeStamps
++ * MUST NOT reset, earned/redeemed counters move together.
++ */
++export function planRedemption(
++  account: Partial<LoyaltyState>,
++  stampCost?: number,
++): RedemptionPlan {
++  const cost = safeCount(stampCost) > 0 ? safeCount(stampCost) : safeCount(account.stampTarget);
++  const before = currentStampsOf(account);
++  const currentStamps = Math.max(0, before - cost);
++  const rewardsRedeemed = safeCount(account.rewardsRedeemed) + 1;
++  return {
++    currentStamps,
++    // A redemption NEVER resets stamp history.
++    lifetimeStamps: Math.max(safeCount(account.lifetimeStamps), before, currentStamps),
++    rewardsEarned: Math.max(safeCount(account.rewardsEarned), rewardsRedeemed),
++    rewardsRedeemed,
++  };
++}
++
++export function isRewardRedeemable(currentStamps: unknown, stampTarget: unknown): boolean {
++  const target = safeCount(stampTarget);
++  return target > 0 && safeCount(currentStamps) >= target;
++}
++
++/** Compact "6 Oct 2026, 9:42 pm" for a Firestore-ish value; "—" when unusable. */
++export function formatTimestamp(value: unknown, options: { withTime?: boolean; fallback?: string } = {}): string {
++  const fallback = options.fallback ?? "—";
++  const ms = toMillisSafe(value);
++  if (ms === null) return fallback;
++  try {
++    return new Intl.DateTimeFormat("en-IN", {
++      day: "numeric",
++      month: "short",
++      year: "numeric",
++      ...(options.withTime ? { hour: "numeric", minute: "2-digit" } : {}),
++    }).format(new Date(ms));
++  } catch {
++    return fallback;
++  }
++}
+diff --git a/src/services/stampPolicy.ts b/src/services/stampPolicy.ts
+index afcd2ac..91935ea 100644
+--- a/src/services/stampPolicy.ts
++++ b/src/services/stampPolicy.ts
+@@ -1,6 +1,49 @@
+-/** Normal staff stamps are separated by an exact 12-hour server-time window. */
+-export const STAMP_COOLDOWN_MS = 12 * 60 * 60 * 1000;
++/**
++ * Staff-App view of the canonical loyalty policy.
++ *
++ * The authoritative implementation lives in `loyaltyCanonical.ts` — a byte-for-byte
++ * copy of the module shipped in the Customer App (`src/shared/loyaltyCanonical.ts`)
++ * and the Admin App (`src/lib/loyalty/canonical.ts`). This file only re-exports it
++ * under the names the Staff App already uses, so there is exactly ONE definition
++ * of the 12-hour stamp window and the lifetime-stamp rules in the project.
++ */
++import {
++  STAMP_COOLDOWN_MS,
++  computeStampCooldown,
++  countLedgerRows,
++  currentStampsOf,
++  evaluateStampGate,
++  formatCooldownRemaining,
++  formatTimestamp,
++  isCountedStampRow,
++  isReplayedStamp,
++  lifetimeStampsOf,
++  planRedemption,
++  planStampAward,
++  reconcileLifetimeStamps,
++  safeCount,
++  toMillisSafe,
++} from "./loyaltyCanonical.ts";
+ 
++export {
++  STAMP_COOLDOWN_MS,
++  computeStampCooldown,
++  countLedgerRows,
++  currentStampsOf,
++  evaluateStampGate,
++  formatCooldownRemaining,
++  formatTimestamp,
++  isCountedStampRow,
++  isReplayedStamp,
++  lifetimeStampsOf,
++  planRedemption,
++  planStampAward,
++  reconcileLifetimeStamps,
++  safeCount,
++  toMillisSafe,
++};
++
++/** Same shape the Staff App has always consumed. */
+ export interface StampCooldownState {
+   eligible: boolean;
+   nextStampAtMillis?: number;
+@@ -11,61 +54,18 @@ export interface StampCooldownState {
+  * Pure cooldown calculation shared by error copy and tests.
+  *
+  * `authoritativeNowMillis` must be the server's decision time when used to
+- * authorize a write. The browser only calls this after Firestore Rules have
+- * already rejected/accepted the write, for informational error copy; it is
+- * never the write gate.
++ * authorize a write. Firestore Rules evaluate `request.time >= lastStampAt + 12h`
++ * inside the commit and are the only write gate; this helper exists for
++ * informational copy after a denial.
+  */
+ export function getStampCooldownState(
+   lastStampAtMillis: number | undefined,
+-  authoritativeNowMillis: number
++  authoritativeNowMillis: number,
+ ): StampCooldownState {
+-  if (
+-    lastStampAtMillis === undefined ||
+-    !Number.isFinite(lastStampAtMillis) ||
+-    !Number.isFinite(authoritativeNowMillis)
+-  ) {
+-    return { eligible: true, remainingMs: 0 };
+-  }
+-
+-  const nextStampAtMillis = lastStampAtMillis + STAMP_COOLDOWN_MS;
+-  const remainingMs = Math.max(0, nextStampAtMillis - authoritativeNowMillis);
++  const cooldown = computeStampCooldown(lastStampAtMillis ?? null, authoritativeNowMillis);
+   return {
+-    eligible: remainingMs === 0,
+-    nextStampAtMillis,
+-    remainingMs,
++    eligible: cooldown.eligible,
++    nextStampAtMillis: cooldown.nextStampAtMillis ?? undefined,
++    remainingMs: cooldown.remainingMs,
+   };
+ }
+-
+-function nonNegativeInt(value: unknown): number {
+-  const parsed =
+-    typeof value === "number"
+-      ? value
+-      : typeof value === "string" && value.trim()
+-        ? Number(value)
+-        : Number.NaN;
+-  return Number.isFinite(parsed) && parsed >= 0 ? Math.floor(parsed) : 0;
+-}
+-
+-/** Preserve the largest trustworthy lifetime value; never reduce stamp history. */
+-export function reconcileLifetimeStamps(
+-  currentStamps: unknown,
+-  storedLifetimeStamps: unknown,
+-  historicalStampCount: number | undefined
+-): number {
+-  return Math.max(
+-    nonNegativeInt(currentStamps),
+-    nonNegativeInt(storedLifetimeStamps),
+-    nonNegativeInt(historicalStampCount)
+-  );
+-}
+-
+-/** Short informational copy; it does not authorize or schedule a stamp. */
+-export function formatCooldownRemaining(remainingMs: number): string {
+-  const safeRemainingMs = Number.isFinite(remainingMs) ? Math.max(0, remainingMs) : 0;
+-  const totalMinutes = Math.ceil(safeRemainingMs / 60_000);
+-  const hours = Math.floor(totalMinutes / 60);
+-  const minutes = totalMinutes % 60;
+-  if (hours > 0 && minutes > 0) return `${hours}h ${minutes}m`;
+-  if (hours > 0) return `${hours}h`;
+-  return `${minutes}m`;
+-}
+diff --git a/tests/loyalty-contracts.test.mjs b/tests/loyalty-contracts.test.mjs
+new file mode 100644
+index 0000000..76af1dd
+--- /dev/null
++++ b/tests/loyalty-contracts.test.mjs
+@@ -0,0 +1,281 @@
++/**
++ * 12-HOUR COOLDOWN + LIFETIME-STAMP CONTRACT TESTS (Admin App copy).
++ *
++ * These tests encode the ONE rule all three applications must share
++ * (Customer App, Staff App, Admin App — project cafe-review7):
++ *
++ *   * 10:00:00 → success · 21:59:59 → reject · 22:00:00 → success
++ *   * two simultaneous requests → only one successful stamp
++ *   * retry of the same transaction → no duplicate
++ *   * blocked request → no visit, no notification, no loyalty increment
++ *
++ * The same assertions are shipped to the other two repositories so a divergence
++ * fails a build instead of silently splitting the loyalty model.
++ */
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import { readFileSync } from "node:fs";
++import { resolve } from "node:path";
++import {
++  STAMP_COOLDOWN_MS,
++  computeStampCooldown,
++  countLedgerRows,
++  currentStampsOf,
++  evaluateStampGate,
++  isCountedStampRow,
++  isReplayedStamp,
++  lifetimeStampsOf,
++  planRedemption,
++  planStampAward,
++  reconcileLifetimeStamps,
++  safeCount,
++  toMillisSafe,
++  formatTimestamp,
++} from "../src/services/loyaltyCanonical.ts";
++
++const read = (file) => readFileSync(resolve(process.cwd(), file), "utf8");
++const rules = read("firestore.rules");
++
++const CLIENT = "cli_bake";
++const OTHER_CLIENT = "cli_rival";
++const CUSTOMER = "uid_kai";
++
++/** 10:00:00 IST on 2026-10-06, as epoch ms. */
++const TEN_AM = Date.parse("2026-10-06T04:30:00.000Z");
++const H = 60 * 60 * 1000;
++
++const gate = (overrides = {}) =>
++  evaluateStampGate({
++    clientId: CLIENT,
++    loyaltyEnabled: true,
++    customerClientId: CLIENT,
++    loyaltyClientId: CLIENT,
++    lastStampAt: null,
++    nowMillis: TEN_AM,
++    transactionId: "TXN-STAMP-1",
++    ...overrides,
++  });
++
++/* ------------------------------------------------------------------ *
++ * 1. The exact 12-hour window
++ * ------------------------------------------------------------------ */
++
++test("10:00:00 → success, 21:59:59 → reject, 22:00:00 → success", () => {
++  assert.equal(STAMP_COOLDOWN_MS, 12 * H);
++
++  // 10:00:00 — the stamp that starts the window.
++  const first = gate({ lastStampAt: null, nowMillis: TEN_AM });
++  assert.equal(first.allowed, true);
++  assert.equal(first.code, "OK");
++
++  // 21:59:59 — one second before the window closes.
++  const almost = gate({ lastStampAt: TEN_AM, nowMillis: TEN_AM + 12 * H - 1000 });
++  assert.equal(almost.allowed, false);
++  assert.equal(almost.code, "COOLDOWN");
++  assert.equal(almost.cooldown.remainingMs, 1000);
++  assert.match(almost.message, /Next stamp available in/);
++
++  // 22:00:00 — exactly 12 hours later.
++  const exactly = gate({ lastStampAt: TEN_AM, nowMillis: TEN_AM + 12 * H });
++  assert.equal(exactly.allowed, true);
++  assert.equal(exactly.code, "OK");
++  assert.equal(exactly.cooldown.remainingMs, 0);
++
++  // One millisecond before the boundary is still rejected (no rounding slop).
++  assert.equal(gate({ lastStampAt: TEN_AM, nowMillis: TEN_AM + 12 * H - 1 }).allowed, false);
++});
++
++test("the cooldown accepts every timestamp shape Firestore stores", () => {
++  const serialized = { seconds: Math.floor(TEN_AM / 1000), nanoseconds: 0 };
++  const iso = new Date(TEN_AM).toISOString();
++  for (const shape of [TEN_AM, serialized, iso, new Date(TEN_AM)]) {
++    const decision = gate({ lastStampAt: shape, nowMillis: TEN_AM + 11 * H });
++    assert.equal(decision.code, "COOLDOWN", `shape ${JSON.stringify(shape)}`);
++    assert.equal(toMillisSafe(shape), TEN_AM);
++  }
++  // Missing/invalid → treated as "no stamp recorded" (never NaN, never blocked forever).
++  for (const shape of [null, undefined, "", "later", {}, Number.NaN]) {
++    const decision = gate({ lastStampAt: shape, nowMillis: TEN_AM });
++    assert.equal(decision.allowed, true, `shape ${String(shape)}`);
++    assert.equal(computeStampCooldown(shape, TEN_AM).remainingMs, 0);
++  }
++});
++
++/* ------------------------------------------------------------------ *
++ * 2. Concurrency and retries
++ * ------------------------------------------------------------------ */
++
++test("two simultaneous requests → only one successful stamp", () => {
++  // Both tills read the SAME pre-commit state, so both would write +1…
++  const parallel = [gate({ lastStampAt: null, transactionId: "TXN-A" }), gate({ lastStampAt: null, transactionId: "TXN-B" })];
++  assert.equal(parallel.filter((d) => d.allowed).length, 2, "the local pre-flight cannot serialize - Firestore does");
++
++  // …which is exactly why the commit must be conditional: Firestore re-reads
++  // lastStampAt inside the transaction and the second commit sees it.
++  const secondAfterFirstCommit = gate({
++    lastStampAt: TEN_AM, // written by the winner of the race
++    nowMillis: TEN_AM + 250,
++    transactionId: "TXN-B",
++  });
++  assert.equal(secondAfterFirstCommit.allowed, false);
++  assert.equal(secondAfterFirstCommit.code, "COOLDOWN");
++
++  // And the ledger/balance rules make the double write impossible: the balance
++  // step and the ledger row are validated against the same getAfter() commit.
++  assert.match(rules, /request\.resource\.data\.currentStamps == loyaltyStampBaseline\(\) \+ 1/);
++  assert.match(rules, /stampCooldownHasElapsed\(request\.resource\.data\.customerId\)/);
++});
++
++test("retrying the same transaction is a replay — never a duplicate stamp", () => {
++  const countedRow = { transactionId: "TXN-1", type: "STAMP_ADDED", visitCounted: true, delta: 1 };
++  assert.equal(isReplayedStamp(countedRow, "TXN-1"), true);
++  assert.equal(gate({ existingLedgerRow: countedRow, transactionId: "TXN-1" }).code, "REPLAY");
++
++  // An uncounted (phase-one) row is NOT a replay: it must still be counted once.
++  const pendingRow = { transactionId: "TXN-2", type: "STAMP_ADDED", visitCounted: false, delta: 1 };
++  assert.equal(isReplayedStamp(pendingRow, "TXN-2"), false);
++  assert.equal(gate({ existingLedgerRow: pendingRow, transactionId: "TXN-2" }).allowed, true);
++
++  // A different operation id is a different stamp.
++  assert.equal(isReplayedStamp(countedRow, "TXN-9"), false);
++
++  // One award plan applied once must never be applied twice by a retry.
++  const before = { currentStamps: 2, lifetimeStamps: 2, rewardsEarned: 0, rewardsRedeemed: 0, stampTarget: 10 };
++  const plan = planStampAward(before);
++  assert.equal(plan.currentStamps, 3);
++  const replay = isReplayedStamp(countedRow, "TXN-1");
++  assert.equal(replay, true);
++  assert.equal(planStampAward(before).currentStamps, 3, "a replayed retry restarts from the stored state, not the incremented one");
++});
++
++/* ------------------------------------------------------------------ *
++ * 3. Blocked requests change nothing
++ * ------------------------------------------------------------------ */
++
++test("a blocked request produces no visit, no notification and no loyalty increment", () => {
++  const account = { currentStamps: 2, lifetimeStamps: 2, stamps: 2, lastStampAt: TEN_AM, rewardsEarned: 0, rewardsRedeemed: 0, stampTarget: 10 };
++
++  for (const decision of [
++    gate({ lastStampAt: TEN_AM, nowMillis: TEN_AM + 2 * H }),
++    gate({ customerClientId: OTHER_CLIENT }),
++    gate({ loyaltyClientId: OTHER_CLIENT }),
++    gate({ loyaltyEnabled: false }),
++  ]) {
++    assert.equal(decision.allowed, false);
++  }
++
++  // The rules never grant a standalone visit/loyalty/notification write: each one
++  // must be justified by a counted ledger row created in the same commit.
++  assert.match(rules, /allow update:[\s\S]*?'totalVisits'[\s\S]*?'lastVisitAt'[\s\S]*?'lastVisitTransactionId'/);
++  assert.match(rules, /getAfter\([\s\S]*?stampTransactions[\s\S]*?\)\.data\.get\('visitCounted', false\) == true/);
++  assert.match(rules, /function matchesStampNotification\(\)[\s\S]*?createdAt', null\) == request\.time/);
++  assert.match(rules, /function validStampAccountMutation\([\s\S]*?matchingStampTransaction\(/);
++  assert.doesNotMatch(rules, /allow\s+(?:read,\s*write|write):\s*if\s+true/);
++});
++
++/* ------------------------------------------------------------------ *
++ * 4. Lifetime stamps + redemption
++ * ------------------------------------------------------------------ */
++
++test("every successful stamp raises current and lifetime by exactly one", () => {
++  const before = { currentStamps: 1, lifetimeStamps: 1, rewardsEarned: 0, rewardsRedeemed: 0, stampTarget: 10 };
++  const after = planStampAward(before);
++  assert.equal(after.currentStamps, 2);
++  assert.equal(after.lifetimeStamps, 2);
++  assert.equal(after.rewardUnlocked, false);
++
++  // Production case: 2 valid transactions, currentStamps = 2, lifetimeStamps = 0.
++  assert.equal(reconcileLifetimeStamps(2, 0, 2), 2, "lifetime is repaired from the ledger, never left at 0");
++  assert.equal(lifetimeStampsOf({ currentStamps: 2, lifetimeStamps: 0, stamps: 2 }, 2), 2);
++
++  // Crossing the reward threshold records the earned reward once.
++  const crossing = planStampAward({ currentStamps: 9, lifetimeStamps: 9, rewardsEarned: 0, rewardsRedeemed: 0, stampTarget: 10 });
++  assert.equal(crossing.currentStamps, 10);
++  assert.equal(crossing.lifetimeStamps, 10);
++  assert.equal(crossing.rewardJustUnlocked, true);
++  assert.equal(crossing.rewardsEarned, 1);
++
++  // A second stamp at the threshold does not mint a second reward.
++  const again = planStampAward({ currentStamps: 10, lifetimeStamps: 10, rewardsEarned: 1, rewardsRedeemed: 0, stampTarget: 10 });
++  assert.equal(again.rewardsEarned, 1);
++});
++
++test("redemption resets currentStamps by the configured cost and never lifetime", () => {
++  const before = { currentStamps: 10, lifetimeStamps: 10, rewardsEarned: 1, rewardsRedeemed: 0, stampTarget: 10 };
++  const plan = planRedemption(before, 10);
++  assert.equal(plan.currentStamps, 0);
++  assert.equal(plan.lifetimeStamps, 10, "lifetime stamps must not reset");
++  assert.equal(plan.rewardsRedeemed, 1);
++  assert.equal(plan.rewardsEarned, 1);
++
++  // Excess stamps are preserved, history still intact.
++  const excess = planRedemption({ ...before, currentStamps: 13 }, 10);
++  assert.equal(excess.currentStamps, 3);
++  assert.equal(excess.lifetimeStamps, 13);
++});
++
++test("counters are never NaN/undefined, dates never render Invalid Date", () => {
++  assert.equal(currentStampsOf(null), 0);
++  assert.equal(currentStampsOf({ stamps: "4" }), 4);
++  assert.equal(currentStampsOf({ currentStamps: 4, stamps: 99 }), 4);
++  assert.equal(safeCount(Number.NaN), 0);
++  assert.equal(safeCount(-3), 0);
++  assert.equal(lifetimeStampsOf(undefined, undefined), 0);
++
++  assert.equal(formatTimestamp(null), "—");
++  assert.equal(formatTimestamp("nonsense"), "—");
++  assert.equal(formatTimestamp(TEN_AM, { withTime: true }).includes("Invalid"), false);
++});
++
++test("the ledger only counts real stamps (pending rows and redemptions excluded)", () => {
++  const rows = [
++    { type: "STAMP_ADDED", visitCounted: true, delta: 1 },
++    { type: "STAMP_ADDED", visitCounted: true, delta: 1 },
++    { type: "STAMP_ADDED", visitCounted: false, delta: 1 }, // uncounted → ignored
++    { type: "REWARD_REDEEMED", delta: -10 }, // redemption → ignored
++    {}, // no data → ignored
++  ];
++  assert.deepEqual(countLedgerRows(rows), { stampCount: 2, redemptionCount: 1, skippedRows: 2 });
++  assert.equal(isCountedStampRow({ type: "REWARD_REDEEMED", delta: -10 }), false);
++  assert.equal(isCountedStampRow({ delta: 1 }), true);
++});
++
++/* ------------------------------------------------------------------ *
++ * 5. Canonical rules surface (admin copy)
++ * ------------------------------------------------------------------ */
++
++test("the shipped rules enforce the cooldown with server time on both writes", () => {
++  assert.match(rules, /request\.time >= lastStampAt \+ duration\.value\(12, 'h'\)/);
++  assert.match(rules, /stampCooldownHasElapsed\(request\.resource\.data\.customerId\)/);
++  assert.match(rules, /stampCooldownHasElapsed\([\s\S]*?sellStamps|stampCooldownHasElapsed\(/);
++});
++
++test("the rules keep every role least-privileged", () => {
++  // No global write, no recursive admin write.
++  const recursive = rules.match(/match \/\{document=\*\*\} \{([\s\S]*?)\n    \}/)?.[1] ?? "";
++  assert.match(recursive, /allow read: if isActiveAdmin\(\)/);
++  assert.doesNotMatch(recursive, /allow\s+[^;]*write/);
++
++  // Customers can read their own loyalty and tokens, never write loyalty.
++  const loyaltyBlock = rules.match(/match \/loyaltyAccounts\/\{customerId\} \{([\s\S]*?)\n    \}/)?.[1] ?? "";
++  assert.match(loyaltyBlock, /uid\(\) == customerId/);
++  assert.doesNotMatch(loyaltyBlock, /allow\s+write/);
++
++  // Review items keep the canonical { id, name } records.
++  assert.match(rules, /function itemRecords\(v, maxItems\)/);
++  assert.match(rules, /itemRecords\(\s*request\.resource\.data\.selectedItems,/);
++
++  // Every collection the three apps share is declared.
++  for (const path of [
++    "match /customers/{customerId}",
++    "match /loyaltyAccounts/{customerId}",
++    "match /customerTokens/{token}",
++    "match /stampTransactions/{transactionId}",
++    "match /rewardRedemptions/{redemptionId}",
++    "match /notifications/{notificationId}",
++    "match /reviews/{reviewId}",
++    "match /feedback/{feedbackId}",
++  ]) {
++    assert.ok(rules.includes(path), `missing rules block: ${path}`);
++  }
++});
+diff --git a/tests/loyalty-parity.test.mjs b/tests/loyalty-parity.test.mjs
+new file mode 100644
+index 0000000..53067fe
+--- /dev/null
++++ b/tests/loyalty-parity.test.mjs
+@@ -0,0 +1,132 @@
++/**
++ * THREE-APP PARITY (Admin App copy).
++ *
++ * Proves that the Customer App, the Staff App and this Admin App ship the SAME
++ * authoritative model for project cafe-review7:
++ *
++ *   1. one byte-identical `firestore.rules` in all three repositories
++ *   2. one byte-identical canonical loyalty module in all three repositories
++ *   3. the three module copies return IDENTICAL decisions for the shared
++ *      boundary table (10:00:00 ok / 21:59:59 reject / 22:00:00 ok, replays,
++ *      cross-business, disabled loyalty, simultaneous stamps)
++ *
++ * Repositories are located via PARITY_REPOS (colon separated) or the sibling
++ * directories next to this checkout. When a repository is not present the
++ * corresponding assertions are skipped with a visible message instead of
++ * passing silently.
++ */
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import { createHash } from "node:crypto";
++import { existsSync, readFileSync } from "node:fs";
++import { resolve, dirname } from "node:path";
++import { fileURLToPath, pathToFileURL } from "node:url";
++
++const here = dirname(fileURLToPath(import.meta.url));
++const repoRoot = resolve(here, "..");
++const parent = dirname(repoRoot);
++
++const sha = (file) => createHash("sha256").update(readFileSync(file)).digest("hex");
++const read = (file) => readFileSync(file, "utf8");
++
++const REPOS = [
++  { name: "Cafe-review7 (admin)", root: repoRoot, rules: "firestore.rules", module: "src/services/loyaltyCanonical.ts", required: true },
++  { name: "Cafe-review (customer)", root: resolve(parent, "Cafe-review"), rules: "firebase/firestore.rules", module: "src/shared/loyaltyCanonical.ts" },
++  { name: "Cafe-review-staff (staff)", root: resolve(parent, "Cafe-review-staff"), rules: "firestore.rules", module: "src/services/loyaltyCanonical.ts" },
++];
++
++const envRepos = (process.env.PARITY_REPOS ?? "").split(":").filter(Boolean);
++if (envRepos.length) {
++  REPOS[1].root = envRepos[0];
++  REPOS[2].root = envRepos[1] ?? REPOS[2].root;
++}
++
++const present = REPOS.filter((repo) => existsSync(resolve(repo.root, repo.rules)) && existsSync(resolve(repo.root, repo.module)));
++const missing = REPOS.filter((repo) => !present.includes(repo));
++
++const TEN_AM = Date.parse("2026-10-06T04:30:00.000Z");
++const H = 3600 * 1000;
++
++const BOUNDARY_TABLE = [
++  ["10:00:00 first stamp", { lastStampAt: null, nowMillis: TEN_AM }, "OK", true],
++  ["21:59:59 (11h59m59s later)", { lastStampAt: TEN_AM, nowMillis: TEN_AM + 12 * H - 1000 }, "COOLDOWN", false],
++  ["22:00:00 exactly 12h later", { lastStampAt: TEN_AM, nowMillis: TEN_AM + 12 * H }, "OK", true],
++  ["22:00:00 minus 1ms", { lastStampAt: TEN_AM, nowMillis: TEN_AM + 12 * H - 1 }, "COOLDOWN", false],
++  ["13h later", { lastStampAt: TEN_AM, nowMillis: TEN_AM + 13 * H }, "OK", true],
++  ["replayed transaction", { lastStampAt: null, nowMillis: TEN_AM, transactionId: "TXN-1", existingLedgerRow: { transactionId: "TXN-1", type: "STAMP_ADDED", visitCounted: true, delta: 1 } }, "REPLAY", false],
++  ["pending (uncounted) row retried", { lastStampAt: null, nowMillis: TEN_AM, transactionId: "TXN-2", existingLedgerRow: { transactionId: "TXN-2", type: "STAMP_ADDED", visitCounted: false, delta: 1 } }, "OK", true],
++  ["other business", { lastStampAt: null, nowMillis: TEN_AM, customerClientId: "cli_other" }, "CROSS_BUSINESS", false],
++  ["loyalty disabled", { lastStampAt: null, nowMillis: TEN_AM, loyaltyEnabled: false }, "LOYALTY_DISABLED", false],
++  ["second of two simultaneous", { lastStampAt: TEN_AM, nowMillis: TEN_AM + 250 }, "COOLDOWN", false],
++];
++
++async function loadModule(repo) {
++  return import(pathToFileURL(resolve(repo.root, repo.module)).href);
++}
++
++for (const repo of present) {
++  test(`${repo.name}: canonical module matches this app byte for byte`, async () => {
++    const reference = REPOS[0];
++    if (repo.root === reference.root) return;
++    assert.equal(
++      sha(resolve(repo.root, repo.module)),
++      sha(resolve(reference.root, reference.module)),
++      `${repo.name} ships a different canonical module`,
++    );
++  });
++
++  test(`${repo.name}: firestore.rules matches this app byte for byte`, () => {
++    const reference = REPOS[0];
++    if (repo.root === reference.root) return;
++    assert.equal(
++      sha(resolve(repo.root, repo.rules)),
++      sha(resolve(reference.root, reference.rules)),
++      `${repo.name} ships different security rules`,
++    );
++  });
++
++  test(`${repo.name}: rules keep the shared cooldown contract`, () => {
++    const rules = read(resolve(repo.root, repo.rules));
++    assert.match(rules, /request\.time >= lastStampAt \+ duration\.value\(12, 'h'\)/);
++    assert.match(rules, /stampCooldownHasElapsed\(request\.resource\.data\.customerId\)/);
++    assert.doesNotMatch(rules, /allow\s+(?:read,\s*write|write):\s*if\s+true/);
++  });
++
++  test(`${repo.name}: the boundary table resolves identically`, async () => {
++    const api = await loadModule(repo);
++    assert.equal(api.STAMP_COOLDOWN_MS, 12 * H);
++    for (const [label, input, code, allowed] of BOUNDARY_TABLE) {
++      const decision = api.evaluateStampGate({
++        clientId: "cli_bake",
++        loyaltyEnabled: true,
++        customerClientId: "cli_bake",
++        loyaltyClientId: "cli_bake",
++        lastStampAt: null,
++        nowMillis: TEN_AM,
++        transactionId: "TXN-NEW",
++        ...input,
++      });
++      assert.equal(decision.code, code, `${repo.name}: ${label}`);
++      assert.equal(decision.allowed, allowed, `${repo.name}: ${label}`);
++    }
++  });
++
++  test(`${repo.name}: lifetime / redemption parity`, async () => {
++    const api = await loadModule(repo);
++    const stamp = api.planStampAward({ currentStamps: 1, lifetimeStamps: 1, rewardsEarned: 0, rewardsRedeemed: 0, stampTarget: 10 });
++    assert.deepEqual([stamp.currentStamps, stamp.lifetimeStamps], [2, 2]);
++    const redemption = api.planRedemption({ currentStamps: 10, lifetimeStamps: 10, rewardsEarned: 1, rewardsRedeemed: 0, stampTarget: 10 }, 10);
++    assert.deepEqual([redemption.currentStamps, redemption.lifetimeStamps, redemption.rewardsRedeemed], [0, 10, 1]);
++    assert.equal(api.lifetimeStampsOf({ currentStamps: 2, lifetimeStamps: 0, stamps: 2 }, 2), 2);
++  });
++}
++
++test("repositories checked in this build", () => {
++  const names = present.map((repo) => repo.name).join(", ");
++  console.log(`parity checked against: ${names}`);
++  if (missing.length) {
++    console.log(`not present in this workspace (skipped): ${missing.map((repo) => `${repo.name} @ ${repo.root}`).join(", ")}`);
++    console.log("set PARITY_REPOS=/path/to/Cafe-review:/path/to/Cafe-review-staff to include them");
++  }
++  assert.ok(present.some((repo) => repo.required), "the repository under test must be present");
++});

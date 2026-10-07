@@ -1,36 +1,131 @@
 rules_version = '2';
 
 // ============================================================================
-// Grounds — CANONICAL Firestore Security Rules · project cafe-review7
+// Cafe Review — CANONICAL Firestore Security Rules for project `cafe-review7`
 //
-// ONE canonical schema shared by the Admin, Customer and Staff apps:
-//   admins/{uid}                     role + primary clientId (+ legacy clientIds[])
-//   clients/{clientId}               store doc with embedded theme/loyalty/wifi/aiReview
-//     /menuCategories, /menuItems, /qrConfigurations, /rewards   (public read)
-//     /stampTransactions, /rewardRedemptions                    (append-only)
-//     /reviews, /feedback                                       (public create)
-//     /aiUsage
-//   staffUsers/{uid}  customers/{id}  loyaltyAccounts/{customerId}
-//   activityLogs/{id} (immutable)     metricsDaily/{clientId_day}
+// ONE Firestore database serves the Customer App, the Admin App and the Staff
+// App, so this file is the PROJECT ruleset — not an app-specific fragment.
+// All three repositories ship this exact file (verified by
+// scripts/verify-rules-parity.mjs in the admin repo) so there is exactly one
+// loyalty authorization model:
 //
-// Least privilege: nothing is globally writable; private data is never
-// globally readable; the frontend-supplied clientId is never trusted alone.
+//   Auth UID -> staffUsers/{uid} -> clientId -> clients/{clientId}
+//   customers/{uid} -> loyaltyAccounts/{uid} -> clients/{id}/stampTransactions
+//
+// Loyalty invariants enforced HERE (never in a frontend):
+//   * 12-hour stamp cooldown with the server clock (request.time >= lastStampAt
+//     + duration.value(12, 'h')) on both the ledger row and the balance.
+//   * one stamp = one immutable ledger row, one visit, one balance step,
+//     one notification, created in the same commit (getAfter() validated).
+//   * lifetimeStamps is monotonic: it can only grow, never reset on redemption.
+//   * customers can read their own loyalty, never write it.
+//   * no recursive admin write grant: config writes are scoped to the admin's
+//     own store (canManage), while customer/loyalty/stamp writes must pass the
+//     collection-specific validation below.
+//
+// Deploy from any of the three repositories with:
+//   npx firebase-tools deploy --only firestore:rules --project cafe-review7
 // ============================================================================
+
 service cloud.firestore {
   match /databases/{database}/documents {
 
-    // ---------------------------------------------------------------- helpers
-    function isSignedIn() { return request.auth != null; }
-    function uid() { return request.auth.uid; }
+    // ============================================================
+    // HELPERS
+    // ============================================================
 
-    function adminDoc() { return get(/databases/$(database)/documents/admins/$(uid())); }
-    function hasAdminDoc() { return isSignedIn() && exists(/databases/$(database)/documents/admins/$(uid())); }
-    function isActiveAdmin() { return hasAdminDoc() && adminDoc().data.status == 'ACTIVE'; }
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function uid() {
+      return request.auth.uid;
+    }
+
+    function inactiveStatus(s) {
+      return s in [
+        'disabled',
+        'DISABLED',
+        'inactive',
+        'INACTIVE',
+        'suspended',
+        'SUSPENDED',
+        'blocked',
+        'BLOCKED',
+        'deactivated',
+        'DEACTIVATED',
+        'removed',
+        'REMOVED',
+        'Disabled',
+        'Inactive',
+        'Suspended',
+        'Blocked',
+        'Deactivated',
+        'Removed'
+      ];
+    }
+
+    // ============================================================
+    // ADMIN
+    // ============================================================
+
+    function isActiveAdmin() {
+      return signedIn()
+        && exists(
+          /databases/$(database)/documents/admins/$(uid())
+        )
+        && get(
+          /databases/$(database)/documents/admins/$(uid())
+        ).data.get('active', true) != false
+        && !inactiveStatus(
+          get(
+            /databases/$(database)/documents/admins/$(uid())
+          ).data.get('status', 'active')
+        );
+    }
+
+    // ============================================================
+    // STAFF
+    // ============================================================
+
+    function staffClientId() {
+      return signedIn()
+        && exists(
+          /databases/$(database)/documents/staffUsers/$(uid())
+        )
+        && get(
+          /databases/$(database)/documents/staffUsers/$(uid())
+        ).data.get('active', true) != false
+        && !inactiveStatus(
+          get(
+            /databases/$(database)/documents/staffUsers/$(uid())
+          ).data.get('status', 'active')
+        )
+        && get(
+          /databases/$(database)/documents/staffUsers/$(uid())
+        ).data.get('clientId', '') is string
+        && get(
+          /databases/$(database)/documents/staffUsers/$(uid())
+        ).data.get('clientId', '') != ''
+          ? get(
+              /databases/$(database)/documents/staffUsers/$(uid())
+            ).data.get('clientId', '')
+          : '';
+    }
+
+    // ---------------------------------------------------------------- admin governance
+    // ONE ADMIN = ONE STORE: client/menu/config writes are scoped to the
+    // admin's own business; only a super admin manages every store.
+    function adminDoc() {
+      return get(/databases/$(database)/documents/admins/$(uid()));
+    }
+
     function isSuperAdmin() {
       return isActiveAdmin()
-        && (adminDoc().data.role == 'SUPER_ADMIN' || uid() == '4T2KTiZiAAYKxJ2FlIXSBsOj6G93');
+        && (adminDoc().data.get('role', '') == 'SUPER_ADMIN'
+            || uid() == '4T2KTiZiAAYKxJ2FlIXSBsOj6G93');
     }
-    /** Normal admin may manage a store if it is their primary store or in their legacy assignment list. */
+
     function canManage(clientId) {
       return isSuperAdmin()
         || (isActiveAdmin()
@@ -38,159 +133,1954 @@ service cloud.firestore {
                 || clientId in adminDoc().data.get('clientIds', [])));
     }
 
-    function staffDoc() { return get(/databases/$(database)/documents/staffUsers/$(uid())); }
-    /** Disabled staff are rejected here, not just hidden in the UI. */
-    function isStaffOf(clientId) {
-      return isSignedIn()
-        && exists(/databases/$(database)/documents/staffUsers/$(uid()))
-        && staffDoc().data.status == 'ACTIVE'
-        && (staffDoc().data.clientId == clientId || clientId in staffDoc().data.get('clientIds', []));
+    function unchanged(field) {
+      return request.resource.data[field] == resource.data[field];
     }
-    function canOperate(clientId) { return canManage(clientId) || isStaffOf(clientId); }
 
-    function isValidClientId(id) { return id is string && id.size() > 0 && id.size() < 64; }
-    function unchanged(field) { return request.resource.data[field] == resource.data[field]; }
+    function isStaffOf(clientId) {
+      return signedIn()
+        && clientId is string
+        && clientId != ''
+        && (
+          isActiveAdmin()
+          || staffClientId() == clientId
+        );
+    }
 
-    // ---------------------------------------------------------------- admins
+    // ============================================================
+    // PUBLIC CLIENT
+    // ============================================================
+
+    function isPublished(data) {
+      return !('status' in data)
+        || data.status in [
+          'PUBLISHED',
+          'published',
+          'ACTIVE',
+          'active',
+          'LIVE',
+          'live'
+        ];
+    }
+
+    function clientIsPublic(clientId) {
+      return clientId is string
+        && clientId != ''
+        && exists(
+          /databases/$(database)/documents/clients/$(clientId)
+        )
+        && isPublished(
+          get(
+            /databases/$(database)/documents/clients/$(clientId)
+          ).data
+        );
+    }
+
+    function validStampTarget(value) {
+      return value is int
+        && value >= 1
+        && value <= 30;
+    }
+
+    function loyaltyCurrentStamps(data) {
+      return data.get('currentStamps', data.get('stamps', 0)) is int
+        && data.get('currentStamps', data.get('stamps', 0)) >= 0
+          ? data.get('currentStamps', data.get('stamps', 0))
+          : 0;
+    }
+
+    // Firestore evaluates request.time on the server at commit. Legacy
+    // customer.lastVisitAt is accepted only as a server-written cooldown source
+    // when loyaltyAccounts.lastStampAt is absent or malformed. A new zero-visit
+    // customer may receive a first stamp; an existing account with activity but
+    // no usable server timestamp fails closed until the repair report is applied.
+    function stampCooldownHasElapsed(customerId) {
+      let loyaltyPath = /databases/$(database)/documents/loyaltyAccounts/$(customerId);
+      let customerPath = /databases/$(database)/documents/customers/$(customerId);
+      let hasLoyalty = exists(loyaltyPath);
+      let lastStampAt = hasLoyalty ? get(loyaltyPath).data.get('lastStampAt', null) : null;
+      let customerData = get(customerPath).data;
+      let lastVisitAt = customerData.get('lastVisitAt', null);
+      return (
+        (
+          lastStampAt is timestamp
+          && request.time >= lastStampAt + duration.value(12, 'h')
+        )
+        || (
+          !(lastStampAt is timestamp)
+          && lastVisitAt is timestamp
+          && request.time >= lastVisitAt + duration.value(12, 'h')
+        )
+        || (
+          !(lastStampAt is timestamp)
+          && !(lastVisitAt is timestamp)
+          && (!hasLoyalty || loyaltyCurrentStamps(get(loyaltyPath).data) == 0)
+          && customerData.get('totalVisits', -1) == 0
+          && customerData.get('createdAt', null) is timestamp
+        )
+      )
+      // If both server-written legacy timestamps exist, enforce the newer one.
+      && (
+        !(lastVisitAt is timestamp)
+        || request.time >= lastVisitAt + duration.value(12, 'h')
+      );
+    }
+
+    function configuredClientStampTarget(clientId) {
+      return (
+        'loyalty' in get(
+          /databases/$(database)/documents/clients/$(clientId)
+        ).data
+        && get(
+          /databases/$(database)/documents/clients/$(clientId)
+        ).data.loyalty is map
+        && 'stampTarget' in get(
+          /databases/$(database)/documents/clients/$(clientId)
+        ).data.loyalty
+        && validStampTarget(
+          get(
+            /databases/$(database)/documents/clients/$(clientId)
+          ).data.loyalty.stampTarget
+        )
+      )
+        ? get(
+            /databases/$(database)/documents/clients/$(clientId)
+          ).data.loyalty.stampTarget
+        : validStampTarget(
+            get(
+              /databases/$(database)/documents/clients/$(clientId)
+            ).data.get('stampTarget', 0)
+          )
+          ? get(
+              /databases/$(database)/documents/clients/$(clientId)
+            ).data.stampTarget
+          : validStampTarget(
+              get(
+                /databases/$(database)/documents/clients/$(clientId)
+              ).data.get('stampsRequired', 0)
+            )
+            ? get(
+                /databases/$(database)/documents/clients/$(clientId)
+              ).data.stampsRequired
+            : validStampTarget(
+                get(
+                  /databases/$(database)/documents/clients/$(clientId)
+                ).data.get('stampsForReward', 0)
+              )
+              ? get(
+                  /databases/$(database)/documents/clients/$(clientId)
+                ).data.stampsForReward
+              : 8;
+    }
+
+    function clientLoyaltyEnabled(clientId) {
+      return exists(
+        /databases/$(database)/documents/clients/$(clientId)
+      )
+      && (
+        get(
+          /databases/$(database)/documents/clients/$(clientId)
+        ).data.get('loyalty', null) is map
+        && 'enabled' in get(
+          /databases/$(database)/documents/clients/$(clientId)
+        ).data.loyalty
+          ? get(
+              /databases/$(database)/documents/clients/$(clientId)
+            ).data.loyalty.get('enabled', true) != false
+          : get(
+              /databases/$(database)/documents/clients/$(clientId)
+            ).data.get('loyaltyEnabled', true) != false
+      );
+    }
+
+    function configuredClientRewardName(clientId) {
+      let clientData = get(
+        /databases/$(database)/documents/clients/$(clientId)
+      ).data;
+      let loyaltyData = clientData.get('loyalty', null);
+      return (
+        loyaltyData is map
+        && loyaltyData.get('rewardName', '') is string
+        && loyaltyData.get('rewardName', '').size() > 0
+      )
+        ? loyaltyData.rewardName
+        : clientData.get('rewardName', '') is string
+          && clientData.get('rewardName', '').size() > 0
+          ? clientData.rewardName
+          : clientData.get('rewardTitle', '') is string
+            && clientData.get('rewardTitle', '').size() > 0
+            ? clientData.rewardTitle
+            : 'Free Coffee';
+    }
+
+    function effectiveStampTarget(clientId, loyaltyData) {
+      // The client document is canonical. Do not let a stale loyalty-account
+      // target override the configured business reward threshold.
+      return configuredClientStampTarget(clientId);
+    }
+
+    function oldRewardCount(loyaltyData) {
+      return loyaltyData.get(
+        'rewardsRedeemed',
+        loyaltyData.get('totalRewardsRedeemed', 0)
+      ) is int
+        && loyaltyData.get(
+          'rewardsRedeemed',
+          loyaltyData.get('totalRewardsRedeemed', 0)
+        ) >= 0
+          ? loyaltyData.get(
+              'rewardsRedeemed',
+              loyaltyData.get('totalRewardsRedeemed', 0)
+            )
+          : 0;
+    }
+
+    function oldRewardEarnedCount(loyaltyData) {
+      return loyaltyData.get(
+        'rewardsEarned',
+        loyaltyData.get('totalRewardsEarned', 0)
+      ) is int
+        && loyaltyData.get(
+          'rewardsEarned',
+          loyaltyData.get('totalRewardsEarned', 0)
+        ) >= 0
+          ? loyaltyData.get(
+              'rewardsEarned',
+              loyaltyData.get('totalRewardsEarned', 0)
+            )
+          : 0;
+    }
+
+    // ============================================================
+    // VALIDATION HELPERS
+    // ============================================================
+
+    function optStr(data, key, max) {
+      return !(key in data)
+        || data[key] == null
+        || (
+          data[key] is string
+          && data[key].size() <= max
+        );
+    }
+
+    /** [{ id, name }] records of REAL selected menu items (Customer App). */
+    function itemRecords(v, maxItems) {
+      return v is list
+        && v.size() <= maxItems
+        && (
+          v.size() == 0
+          || (
+            v[0] is map
+            && v[0].keys().hasOnly(['id', 'name'])
+            && v[0].get('id', null) is string
+            && v[0].get('id', '').size() > 0
+            && v[0].get('id', '').size() <= 128
+            && v[0].get('name', null) is string
+            && v[0].get('name', '').size() > 0
+            && v[0].get('name', '').size() <= 80
+          )
+        );
+    }
+
+    function strList(v, maxItems, maxLen) {
+      return v is list
+        && v.size() <= maxItems
+        && (
+          v.size() == 0
+          || (
+            v[0] is string
+            && v[0].size() <= maxLen
+          )
+        );
+    }
+
+    function validName(n) {
+      return n is string
+        && n.size() >= 2
+        && n.size() <= 50;
+    }
+
+    function validPhone(p) {
+      return p is string
+        && p.matches('^[+]91[6-9][0-9]{9}$');
+    }
+
+    function validEmail(e) {
+      return e == null
+        || (
+          e is string
+          && e.size() <= 254
+          && e.matches('^[^@ ]+@[^@ ]+[.][^@ ]+$')
+        );
+    }
+
+    function phoneKey(clientId, phone) {
+      return clientId + '_' + phone[1:];
+    }
+
+    // ============================================================
+    // QR TOKEN ATOMIC VALIDATION
+    // ============================================================
+
+    function tokenAfterMatches(token, owner, clientId) {
+      return token is string
+        && token.matches('^[a-f0-9]{64}$')
+        && getAfter(
+          /databases/$(database)/documents/customerTokens/$(token)
+        ).data.customerId == owner
+        && getAfter(
+          /databases/$(database)/documents/customerTokens/$(token)
+        ).data.clientId == clientId;
+    }
+
+    // ============================================================
+    // ADMIN READ ACCESS ONLY
+    //
+    // Firestore allows grants from matching blocks to OR together. A broad
+    // recursive `write` here would bypass every cooldown, visit, loyalty, and
+    // idempotency condition below, so admin writes use the same per-collection
+    // contracts as staff writes (or must be added as separately audited paths).
+    // ============================================================
+
+    match /{document=**} {
+      allow read: if isActiveAdmin();
+    }
+
+    // ============================================================
+    // ADMINS
+    // ============================================================
+
     match /admins/{adminId} {
-      allow read: if isSignedIn() && (uid() == adminId || isSuperAdmin());
-      allow create: if isSuperAdmin() || (uid() == adminId && adminId == '4T2KTiZiAAYKxJ2FlIXSBsOj6G93');
-      // Self-update may only claim a primary store ONCE (null → id) and touch
-      // bookkeeping; role/status are frozen for non-super admins.
+      allow get: if signedIn() && (uid() == adminId || isSuperAdmin());
+      // Bootstrap: the platform super admin may create only their own document.
+      allow create: if isSuperAdmin()
+        || (uid() == adminId && adminId == '4T2KTiZiAAYKxJ2FlIXSBsOj6G93');
+      // Self-update may only claim a primary store ONCE (null -> id) and touch
+      // bookkeeping; role/status stay frozen for non-super admins.
       allow update: if isSuperAdmin()
         || (uid() == adminId
-            && unchanged('role') && unchanged('status')
+            && request.resource.data.get('role', '') == resource.data.get('role', '')
+            && request.resource.data.get('status', '') == resource.data.get('status', '')
             && (resource.data.get('clientId', null) == null
                 || request.resource.data.get('clientId', null) == resource.data.get('clientId', null)));
       allow delete: if isSuperAdmin();
     }
 
-    // ---------------------------------------------------------------- clients
+    // ============================================================
+    // STAFF REGISTRY
+    // ============================================================
+
+    match /staffUsers/{staffId} {
+
+      allow get: if signedIn() && uid() == staffId;
+
+      allow list: if staffClientId() != ''
+        && resource.data.clientId == staffClientId();
+
+      // Admins manage the staff registry explicitly; no recursive admin grant
+      // applies to customer/loyalty/stamp documents.
+      // Scoped to the admin's own store; staff can never be re-homed silently.
+      allow create: if canManage(request.resource.data.get('clientId', ''));
+      allow update: if canManage(request.resource.data.get('clientId', ''))
+        && unchanged('clientId');
+      allow delete: if canManage(resource.data.get('clientId', ''));
+    }
+
+    // ============================================================
+    // CLIENTS / BUSINESSES
+    // ============================================================
+
     match /clients/{clientId} {
-      // Public: Customer App resolves /{slug}. Wi-Fi PASSWORDS are never
-      // stored in this document (only ssid + message), so public read is safe.
-      allow read: if true;
+
+      // Public customer application can read published businesses.
+      // Staff can read their own business.
+      allow get:
+        if isPublished(resource.data)
+        || isStaffOf(clientId);
+
+      // Customer App resolves published businesses by slug.
+      // Only PUBLISHED businesses may be queried.
+      allow list:
+        if resource.data.status == 'PUBLISHED';
+
       // Store creation: SUPER_ADMIN freely; a CLIENT_ADMIN exactly once, for
       // themselves, as part of the atomic ownership-claim transaction.
       allow create: if isSuperAdmin()
         || (isActiveAdmin()
-            && adminDoc().data.role == 'CLIENT_ADMIN'
+            && adminDoc().data.get('role', '') == 'CLIENT_ADMIN'
             && adminDoc().data.get('clientId', null) == null
             && request.resource.data.get('ownerUid', '') == uid()
             && request.resource.data.status == 'DRAFT');
+      // Config writes stay inside the admin's own store. This does not grant
+      // writes to nested stamps, visits, loyalty accounts, or notifications.
       allow update: if canManage(clientId)
         && (!('ownerUid' in resource.data) || unchanged('ownerUid') || isSuperAdmin());
       allow delete: if false; // never delete store history
 
-      // -- public catalogue --
-      match /menuCategories/{id} {
-        allow read: if true;
-        allow write: if canManage(clientId);
-      }
-      match /menuItems/{id} {
-        allow read: if true;
-        allow write: if canManage(clientId);
-      }
-      match /qrConfigurations/{id} {
-        allow read: if true; // QR destination = public store route; payload holds no secrets
-        allow create: if canManage(clientId)
-          && request.resource.data.clientId == clientId
-          && request.resource.data.type in ['MAIN', 'COUNTER', 'TABLE'];
-        allow update, delete: if canManage(clientId);
-      }
-      match /rewards/{id} {
-        allow read: if true;
-        allow write: if canManage(clientId);
+      // ----------------------------------------------------------
+      // MENU CATEGORIES
+      // ----------------------------------------------------------
+
+      match /menuCategories/{categoryId} {
+        allow read:
+          if clientIsPublic(clientId)
+          || isStaffOf(clientId);
+        allow create, update, delete: if canManage(clientId);
       }
 
-      // -- operational ledgers (append-only) --
-      match /stampTransactions/{id} {
-        allow read: if canOperate(clientId);
-        allow create: if canOperate(clientId) && request.resource.data.clientId == clientId;
-        allow update, delete: if false; // append-only ledger; corrections are new transactions
-      }
-      match /rewardRedemptions/{id} {
-        allow read: if canOperate(clientId);
-        allow create: if canOperate(clientId) && request.resource.data.clientId == clientId;
-        allow update, delete: if false; // historical records are never deleted
+      // ----------------------------------------------------------
+      // MENU ITEMS
+      // ----------------------------------------------------------
+
+      match /menuItems/{itemId} {
+        allow read:
+          if clientIsPublic(clientId)
+          || isStaffOf(clientId);
+        allow create, update, delete: if canManage(clientId);
       }
 
-      // -- customer submissions: public create (schema-validated), admin read/moderate --
-      match /reviews/{id} {
-        allow read: if canManage(clientId);
-        allow create: if request.resource.data.clientId == clientId
-          && request.resource.data.rating is int
-          && request.resource.data.rating >= 1 && request.resource.data.rating <= 5
-          && request.resource.data.content is string
-          && request.resource.data.content.size() <= 2000;
-        allow update: if canManage(clientId)
-          && unchanged('rating') && unchanged('createdAt'); // admins moderate, never rewrite the customer's rating
-        allow delete: if false;
+      // ----------------------------------------------------------
+      // REWARDS
+      // ----------------------------------------------------------
+
+      match /rewards/{rewardId} {
+        allow read:
+          if clientIsPublic(clientId)
+          || isStaffOf(clientId);
+        allow create, update, delete: if canManage(clientId);
       }
-      match /feedback/{id} {
-        allow read: if canManage(clientId);
-        // Anonymous by design — the schema holds no identity fields and none may be added.
-        allow create: if request.resource.data.clientId == clientId
-          && request.resource.data.message is string
-          && request.resource.data.message.size() > 0
-          && request.resource.data.message.size() <= 2000
-          && request.resource.data.keys().hasOnly(['clientId', 'message', 'sentiment', 'status', 'createdAt']);
-        allow update: if canManage(clientId) && unchanged('message') && unchanged('createdAt');
-        allow delete: if false;
+
+      // ----------------------------------------------------------
+      // QR CONFIGURATIONS
+      // ----------------------------------------------------------
+
+      match /qrConfigurations/{qrId} {
+        allow read:
+          if isStaffOf(clientId);
+        allow create, update, delete: if canManage(clientId);
       }
+
+      // ----------------------------------------------------------
+      // AI REVIEW USAGE (per client, per month) — admin add-on
+      // ----------------------------------------------------------
       match /aiUsage/{month} {
         allow read: if canManage(clientId);
         allow create, update: if canManage(clientId);
         allow delete: if false;
       }
+
+      // ==========================================================
+      // STAMP TRANSACTIONS
+      // ==========================================================
+
+      match /stampTransactions/{transactionId} {
+
+        allow read:
+          if isStaffOf(clientId);
+
+        // Normal stamps are final, create-only activity rows. The same commit
+        // creates the customer visit, canonical loyalty balance, and Firebase
+        // notification. Firestore's request.time is the cooldown authority.
+        allow create:
+          if isStaffOf(clientId)
+          && request.resource.data.keys().hasOnly([
+            'clientId',
+            'customerId',
+            'transactionId',
+            'staffId',
+            'staffUid',
+            'staffName',
+            'actorType',
+            'actorName',
+            'type',
+            'title',
+            'description',
+            'reason',
+            'delta',
+            'addedCount',
+            'customerName',
+            'customerCode',
+            'visitCounted',
+            'visitCountedAt',
+            'stampCountBefore',
+            'stampCountAfter',
+            'stampTarget',
+            'rewardName',
+            'rewardUnlocked',
+            'notes',
+            'badgeText',
+            'badgeType',
+            'createdAt'
+          ])
+          && request.resource.data.keys().hasAll([
+            'clientId',
+            'customerId',
+            'transactionId',
+            'staffId',
+            'staffUid',
+            'type',
+            'visitCounted',
+            'createdAt'
+          ])
+          && request.resource.data.clientId == clientId
+          && request.resource.data.customerId is string
+          && request.resource.data.customerId != ''
+          && request.resource.data.transactionId == transactionId
+          && request.resource.data.staffId == uid()
+          && request.resource.data.staffUid == uid()
+          && request.resource.data.createdAt == request.time
+          && exists(
+            /databases/$(database)/documents/customers/$(request.resource.data.customerId)
+          )
+          && get(
+            /databases/$(database)/documents/customers/$(request.resource.data.customerId)
+          ).data.get('clientId', '') == clientId
+          && (
+            (
+              request.resource.data.type == 'STAMP_ADDED'
+              && request.resource.data.delta == 1
+              && request.resource.data.get('addedCount', 0) == 1
+              && request.resource.data.visitCounted == true
+              && request.resource.data.visitCountedAt == request.time
+              && request.resource.data.stampCountBefore is int
+              && request.resource.data.stampCountBefore >= 0
+              && request.resource.data.stampCountAfter is int
+              && request.resource.data.stampCountAfter == request.resource.data.stampCountBefore + 1
+              && validStampTarget(request.resource.data.stampTarget)
+              && clientLoyaltyEnabled(clientId)
+              && request.resource.data.stampTarget == configuredClientStampTarget(clientId)
+              && request.resource.data.rewardName is string
+              && request.resource.data.rewardName.size() > 0
+              && request.resource.data.rewardName.size() <= 120
+              && request.resource.data.rewardName == configuredClientRewardName(clientId)
+              && request.resource.data.rewardUnlocked
+                == (request.resource.data.stampCountAfter >= request.resource.data.stampTarget)
+              && stampCooldownHasElapsed(request.resource.data.customerId)
+              && (
+                (
+                  !exists(
+                    /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+                  )
+                  && request.resource.data.stampCountBefore == 0
+                )
+                || (
+                  exists(
+                    /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+                  )
+                  && get(
+                    /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+                  ).data.get('clientId', '') == clientId
+                  && get(
+                    /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+                  ).data.get('customerId', request.resource.data.customerId)
+                    == request.resource.data.customerId
+                  && loyaltyCurrentStamps(
+                    get(
+                      /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+                    ).data
+                  ) == request.resource.data.stampCountBefore
+                )
+              )
+              && existsAfter(
+                /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+              )
+              && getAfter(
+                /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+              ).data.get('clientId', '') == clientId
+              && getAfter(
+                /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+              ).data.get('customerId', '') == request.resource.data.customerId
+              && getAfter(
+                /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+              ).data.get('currentStamps', -1) == request.resource.data.stampCountAfter
+              && getAfter(
+                /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+              ).data.get('stamps', -1) == request.resource.data.stampCountAfter
+              && getAfter(
+                /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+              ).data.get('stampTarget', 0) == request.resource.data.stampTarget
+              && getAfter(
+                /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+              ).data.get('rewardName', '') == request.resource.data.rewardName
+              && getAfter(
+                /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+              ).data.get('isEligibleForReward', false) == request.resource.data.rewardUnlocked
+              && getAfter(
+                /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+              ).data.get('lastStampAt', null) == request.time
+              && getAfter(
+                /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+              ).data.get('updatedAt', null) == request.time
+              && existsAfter(
+                /databases/$(database)/documents/customers/$(request.resource.data.customerId)
+              )
+              && getAfter(
+                /databases/$(database)/documents/customers/$(request.resource.data.customerId)
+              ).data.get('clientId', '') == clientId
+              && getAfter(
+                /databases/$(database)/documents/customers/$(request.resource.data.customerId)
+              ).data.get('lastVisitTransactionId', '') == transactionId
+              && getAfter(
+                /databases/$(database)/documents/customers/$(request.resource.data.customerId)
+              ).data.get('lastVisitAt', null) == request.time
+              && getAfter(
+                /databases/$(database)/documents/customers/$(request.resource.data.customerId)
+              ).data.get('updatedAt', null) == request.time
+              && existsAfter(
+                /databases/$(database)/documents/clients/$(clientId)/notifications/$(transactionId + '_stamp')
+              )
+              && getAfter(
+                /databases/$(database)/documents/clients/$(clientId)/notifications/$(transactionId + '_stamp')
+              ).data.get('type', '') == 'STAMP_ADDED'
+              && getAfter(
+                /databases/$(database)/documents/clients/$(clientId)/notifications/$(transactionId + '_stamp')
+              ).data.get('clientId', '') == clientId
+              && getAfter(
+                /databases/$(database)/documents/clients/$(clientId)/notifications/$(transactionId + '_stamp')
+              ).data.get('customerId', '') == request.resource.data.customerId
+              && getAfter(
+                /databases/$(database)/documents/clients/$(clientId)/notifications/$(transactionId + '_stamp')
+              ).data.get('staffUid', '') == uid()
+              && getAfter(
+                /databases/$(database)/documents/clients/$(clientId)/notifications/$(transactionId + '_stamp')
+              ).data.get('read', true) == false
+              && getAfter(
+                /databases/$(database)/documents/clients/$(clientId)/notifications/$(transactionId + '_stamp')
+              ).data.get('createdAt', null) == request.time
+              && getAfter(
+                /databases/$(database)/documents/clients/$(clientId)/notifications/$(transactionId + '_stamp')
+              ).data.get('metadata', null) is map
+              && getAfter(
+                /databases/$(database)/documents/clients/$(clientId)/notifications/$(transactionId + '_stamp')
+              ).data.metadata.get('transactionId', '') == transactionId
+            )
+            || (
+              request.resource.data.type == 'REWARD_REDEEMED'
+              && request.resource.data.delta is int
+              && request.resource.data.delta < 0
+              && request.resource.data.visitCounted == false
+              && request.resource.data.get('rewardName', '') == configuredClientRewardName(clientId)
+              && existsAfter(
+                /databases/$(database)/documents/clients/$(clientId)/rewardRedemptions/$(transactionId)
+              )
+              && getAfter(
+                /databases/$(database)/documents/clients/$(clientId)/rewardRedemptions/$(transactionId)
+              ).data.get('clientId', '') == clientId
+              && getAfter(
+                /databases/$(database)/documents/clients/$(clientId)/rewardRedemptions/$(transactionId)
+              ).data.get('customerId', '') == request.resource.data.customerId
+              && getAfter(
+                /databases/$(database)/documents/clients/$(clientId)/rewardRedemptions/$(transactionId)
+              ).data.get('staffUid', '') == uid()
+              && getAfter(
+                /databases/$(database)/documents/clients/$(clientId)/rewardRedemptions/$(transactionId)
+              ).data.get('rewardName', '') == request.resource.data.get('rewardName', '')
+            )
+          );
+
+        // Stamp history is immutable; reward activity rows are also create-only.
+        allow update, delete: if false;
+      }
+
+      // ==========================================================
+      // REWARD REDEMPTIONS
+      // ==========================================================
+
+      match /rewardRedemptions/{redemptionId} {
+
+        allow read:
+          if isStaffOf(clientId);
+
+        // A redemption is one atomic, idempotent business transaction:
+        // - the customer and loyalty account already belong to this business;
+        // - the authenticated staff UID is recorded on the document;
+        // - the customer has the configured number of stamps;
+        // - the reward, matching activity row and loyalty reset all appear in
+        //   this same commit. There is no update/delete path to duplicate it.
+        allow create:
+          if isStaffOf(clientId)
+          && clientLoyaltyEnabled(clientId)
+          && request.resource.data.keys().hasOnly([
+            'clientId',
+            'customerId',
+            'customerName',
+            'customerCode',
+            'rewardName',
+            'stampCost',
+            'stampsResetFrom',
+            'stampsResetTo',
+            'staffUid',
+            'staffId',
+            'staffName',
+            'actorType',
+            'actorName',
+            'transactionId',
+            'redeemedAt',
+            'createdAt'
+          ])
+          && request.resource.data.keys().hasAll([
+            'clientId',
+            'customerId',
+            'rewardName',
+            'stampCost',
+            'stampsResetFrom',
+            'stampsResetTo',
+            'staffUid',
+            'staffId',
+            'transactionId',
+            'redeemedAt',
+            'createdAt'
+          ])
+          && request.resource.data.clientId == clientId
+          && request.resource.data.transactionId == redemptionId
+          && request.resource.data.staffUid == uid()
+          && request.resource.data.staffId == uid()
+          && request.resource.data.rewardName is string
+          && request.resource.data.rewardName.size() > 0
+          && request.resource.data.rewardName.size() <= 120
+          && request.resource.data.rewardName == configuredClientRewardName(clientId)
+          && request.resource.data.customerId is string
+          && request.resource.data.customerId != ''
+          && request.resource.data.stampCost is int
+          && request.resource.data.stampCost >= 1
+          && request.resource.data.stampCost <= 30
+          && exists(
+            /databases/$(database)/documents/customers/$(request.resource.data.customerId)
+          )
+          && get(
+            /databases/$(database)/documents/customers/$(request.resource.data.customerId)
+          ).data.get('clientId', '') == clientId
+          && exists(
+            /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+          )
+          && get(
+            /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+          ).data.get('clientId', '') == clientId
+          && get(
+            /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+          ).data.get('customerId', request.resource.data.customerId) == request.resource.data.customerId
+          && loyaltyCurrentStamps(
+            get(
+              /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+            ).data
+          ) >= request.resource.data.stampCost
+          && request.resource.data.stampCost == effectiveStampTarget(
+            clientId,
+            get(
+              /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+            ).data
+          )
+          && request.resource.data.stampsResetFrom == loyaltyCurrentStamps(
+            get(
+              /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+            ).data
+          )
+          && request.resource.data.stampsResetTo
+            == request.resource.data.stampsResetFrom - request.resource.data.stampCost
+          && request.resource.data.redeemedAt == request.time
+          && request.resource.data.createdAt == request.time
+          && existsAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(redemptionId)
+          )
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(redemptionId)
+          ).data.get('clientId', '') == clientId
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(redemptionId)
+          ).data.get('customerId', '') == request.resource.data.customerId
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(redemptionId)
+          ).data.get('staffId', '') == uid()
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(redemptionId)
+          ).data.get('staffUid', '') == uid()
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(redemptionId)
+          ).data.get('type', '') == 'REWARD_REDEEMED'
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(redemptionId)
+          ).data.get('delta', 0) == -request.resource.data.stampCost
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(redemptionId)
+          ).data.get('createdAt', null) == request.time
+          && getAfter(
+            /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+          ).data.get('clientId', '') == clientId
+          && getAfter(
+            /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+          ).data.get('customerId', '') == request.resource.data.customerId
+          && getAfter(
+            /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+          ).data.get('currentStamps', -1) == request.resource.data.stampsResetTo
+          && getAfter(
+            /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+          ).data.get('stamps', -1) == request.resource.data.stampsResetTo
+          && getAfter(
+            /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+          ).data.get('lifetimeStamps', -1)
+            >= get(
+                /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+              ).data.get('lifetimeStamps', 0)
+          && getAfter(
+            /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+          ).data.get('rewardsRedeemed', 0)
+            >= oldRewardCount(
+              get(
+                /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+              ).data
+            ) + 1
+          && getAfter(
+            /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+          ).data.get('totalRewardsRedeemed', 0)
+            == getAfter(
+                /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+              ).data.get('rewardsRedeemed', -1)
+          && getAfter(
+            /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+          ).data.get('isEligibleForReward', true)
+            == (request.resource.data.stampsResetTo >= request.resource.data.stampCost)
+          && getAfter(
+            /databases/$(database)/documents/loyaltyAccounts/$(request.resource.data.customerId)
+          ).data.get('lastRewardRedemptionId', '') == redemptionId;
+
+        allow update, delete: if false;
+      }
+
+      // ==========================================================
+      // FEEDBACK
+      // ==========================================================
+
+      match /feedback/{feedbackId} {
+
+        allow create:
+          if signedIn()
+          && clientIsPublic(clientId)
+          && request.resource.data.keys().hasOnly([
+            'clientId',
+            'message',
+            'rating',
+            'table',
+            'location',
+            'createdAt'
+          ])
+          && request.resource.data.clientId == clientId
+          && request.resource.data.message is string
+          && request.resource.data.message.size() >= 3
+          && request.resource.data.message.size() <= 2000
+          && (
+            request.resource.data.rating == null
+            || (
+              request.resource.data.rating is int
+              && request.resource.data.rating >= 1
+              && request.resource.data.rating <= 5
+            )
+          )
+          && optStr(
+            request.resource.data,
+            'table',
+            32
+          )
+          && optStr(
+            request.resource.data,
+            'location',
+            32
+          )
+          && request.resource.data.createdAt == request.time;
+
+        allow read:
+          if isStaffOf(clientId);
+      }
+
+      // ==========================================================
+      // REVIEWS
+      // ==========================================================
+
+      match /reviews/{reviewId} {
+
+        allow create:
+          if signedIn()
+          && clientIsPublic(clientId)
+          && request.resource.data.keys().hasOnly([
+            'clientId',
+            'customerId',
+            'overallRating',
+            'staffRating',
+            'serviceRating',
+            'selectedItems',
+            'itemsTried',
+            'menuItemIds',
+            'generatedReview',
+            'provider',
+            'table',
+            'location',
+            'createdAt'
+          ])
+          && request.resource.data.clientId == clientId
+          && request.resource.data.customerId == uid()
+          && request.resource.data.generatedReview is string
+          && request.resource.data.generatedReview.size() <= 4000
+          // Canonical: [{ id, name }] records of the REAL selected menu items.
+          // Legacy string lists stay valid so an older client keeps working.
+          && (
+            itemRecords(
+              request.resource.data.selectedItems,
+              20
+            )
+            || strList(
+              request.resource.data.selectedItems,
+              20,
+              80
+            )
+          )
+          && (
+            !('itemsTried' in request.resource.data)
+            || strList(
+              request.resource.data.itemsTried,
+              20,
+              80
+            )
+          )
+          && (
+            !('menuItemIds' in request.resource.data)
+            || strList(
+              request.resource.data.menuItemIds,
+              20,
+              128
+            )
+          )
+          && optStr(
+            request.resource.data,
+            'overallRating',
+            40
+          )
+          && optStr(
+            request.resource.data,
+            'staffRating',
+            40
+          )
+          && optStr(
+            request.resource.data,
+            'serviceRating',
+            40
+          )
+          && optStr(
+            request.resource.data,
+            'provider',
+            16
+          )
+          && optStr(
+            request.resource.data,
+            'table',
+            32
+          )
+          && optStr(
+            request.resource.data,
+            'location',
+            32
+          )
+          && request.resource.data.createdAt == request.time;
+
+        allow read:
+          if isStaffOf(clientId);
+      }
+
+      // ==========================================================
+      // ANALYTICS EVENTS
+      // ==========================================================
+
+      match /events/{eventId} {
+
+        allow create:
+          if signedIn()
+          && clientIsPublic(clientId)
+          && request.resource.data.keys().hasOnly([
+            'clientId',
+            'eventType',
+            'timestamp',
+            'customerId',
+            'menuItemId',
+            'tableId',
+            'network'
+          ])
+          && request.resource.data.clientId == clientId
+          && request.resource.data.eventType in [
+            'QR_OPENED',
+            'MENU_VIEWED',
+            'MENU_ITEM_VIEWED',
+            'GOOGLE_REVIEW_CLICKED',
+            'SOCIAL_CLICKED',
+            'WIFI_VIEWED',
+            'FEEDBACK_SUBMITTED',
+            'AI_REVIEW_GENERATED',
+            'LOYALTY_VIEWED'
+          ]
+          && request.resource.data.timestamp == request.time
+          && (
+            !('customerId' in request.resource.data)
+            || request.resource.data.customerId == uid()
+          )
+          && optStr(
+            request.resource.data,
+            'menuItemId',
+            128
+          )
+          && optStr(
+            request.resource.data,
+            'tableId',
+            32
+          )
+          && optStr(
+            request.resource.data,
+            'network',
+            32
+          );
+
+        allow read:
+          if isStaffOf(clientId);
+      }
+      // ----------------------------------------------------------
+      // NOTIFICATIONS — real business events, staff only
+      // ----------------------------------------------------------
+      //
+      // Staff read their own business's notifications, append schema-valid
+      // events for that same business, and may only flip `read`. Everything
+      // else is immutable and nothing is ever deleted.
+      match /notifications/{notificationId} {
+
+        function matchesStampNotification() {
+          let metadata = request.resource.data.get('metadata', null);
+          let txId = metadata is map ? metadata.get('transactionId', '') : '';
+          return txId is string
+            && txId != ''
+            && notificationId == txId + '_stamp'
+            && existsAfter(
+              /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(txId)
+            )
+            && getAfter(
+              /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(txId)
+            ).data.get('type', '') == 'STAMP_ADDED'
+            && getAfter(
+              /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(txId)
+            ).data.get('customerId', '') == request.resource.data.get('customerId', '')
+            && getAfter(
+              /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(txId)
+            ).data.get('staffUid', '') == uid()
+            && getAfter(
+              /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(txId)
+            ).data.get('createdAt', null) == request.time;
+        }
+
+        function matchesReadyRewardNotification() {
+          let metadata = request.resource.data.get('metadata', null);
+          let txId = metadata is map ? metadata.get('transactionId', '') : '';
+          return txId is string
+            && txId != ''
+            && notificationId == txId + '_reward_ready'
+            && existsAfter(
+              /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(txId)
+            )
+            && getAfter(
+              /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(txId)
+            ).data.get('type', '') == 'STAMP_ADDED'
+            && getAfter(
+              /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(txId)
+            ).data.get('rewardUnlocked', false) == true
+            && getAfter(
+              /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(txId)
+            ).data.get('customerId', '') == request.resource.data.get('customerId', '')
+            && getAfter(
+              /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(txId)
+            ).data.get('staffUid', '') == uid()
+            && getAfter(
+              /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(txId)
+            ).data.get('createdAt', null) == request.time;
+        }
+
+        function matchesRedeemedRewardNotification() {
+          let metadata = request.resource.data.get('metadata', null);
+          let txId = metadata is map ? metadata.get('transactionId', '') : '';
+          return txId is string
+            && txId != ''
+            && notificationId == txId + '_redeemed'
+            && exists(
+              /databases/$(database)/documents/clients/$(clientId)/rewardRedemptions/$(txId)
+            )
+            && get(
+              /databases/$(database)/documents/clients/$(clientId)/rewardRedemptions/$(txId)
+            ).data.get('customerId', '') == request.resource.data.get('customerId', '')
+            && get(
+              /databases/$(database)/documents/clients/$(clientId)/rewardRedemptions/$(txId)
+            ).data.get('staffUid', '') == uid()
+            && exists(
+              /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(txId)
+            )
+            && get(
+              /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(txId)
+            ).data.get('type', '') == 'REWARD_REDEEMED';
+        }
+
+        allow read:
+          if isStaffOf(clientId);
+
+        allow create:
+          if isStaffOf(clientId)
+          && request.resource.data.get('clientId', '') == clientId
+          && request.resource.data.get('type', '') in [
+            'REWARD_READY',
+            'STAMP_ADDED',
+            'REWARD_REDEEMED',
+            'SYSTEM'
+          ]
+          && request.resource.data.get('title', '') is string
+          && request.resource.data.title.size() > 0
+          && request.resource.data.title.size() <= 120
+          && request.resource.data.get('message', '') is string
+          && request.resource.data.message.size() <= 400
+          && request.resource.data.get('read', true) == false
+          && request.resource.data.get('staffUid', '') == uid()
+          && request.resource.data.get('createdAt', null) == request.time
+          && (
+            (request.resource.data.type == 'STAMP_ADDED' && matchesStampNotification())
+            || (request.resource.data.type == 'REWARD_READY' && matchesReadyRewardNotification())
+            || (request.resource.data.type == 'REWARD_REDEEMED' && matchesRedeemedRewardNotification())
+            || request.resource.data.type == 'SYSTEM'
+          );
+
+        // The ONLY mutable field is `read`.
+        allow update:
+          if isStaffOf(clientId)
+          && resource.data.get('clientId', clientId) == clientId
+          && request.resource.data.get('clientId', clientId) == clientId
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read'])
+          && request.resource.data.read is bool;
+
+        allow delete: if false;
+      }
+
     }
 
-    // ---------------------------------------------------------------- staffUsers
-    // Credentials live in Firebase Auth only. List queries MUST pin clientId.
-    match /staffUsers/{staffId} {
-      allow read: if isSignedIn()
-        && (uid() == staffId || isSuperAdmin() || canManage(resource.data.clientId));
-      allow create: if isActiveAdmin() && canManage(request.resource.data.clientId);
-      allow update: if isActiveAdmin() && canManage(resource.data.clientId)
-        && unchanged('clientId'); // staff can't be silently moved between stores
-      allow delete: if isActiveAdmin() && canManage(resource.data.clientId);
+    // ============================================================
+    // LOYALTY ACCOUNTS
+    // ============================================================
+
+    match /loyaltyAccounts/{customerId} {
+
+      // Customer can read own loyalty account.
+      allow get:
+        if signedIn()
+        && uid() == customerId;
+
+      // Staff/admin can read an existing account for their business.
+      allow get:
+        if isStaffOf(resource.data.get('clientId', ''));
+
+      // A missing account is readable as zero only for this staff business's
+      // corresponding customer.
+      allow get:
+        if resource == null
+        && staffClientId() != ''
+        && exists(
+          /databases/$(database)/documents/customers/$(customerId)
+        )
+        && get(
+          /databases/$(database)/documents/customers/$(customerId)
+        ).data.get('clientId', '') == staffClientId();
+
+      allow list:
+        if staffClientId() != ''
+        && resource.data.get('clientId', '') == staffClientId();
+
+      function loyaltyStampBaseline() {
+        return resource == null ? 0 : loyaltyCurrentStamps(resource.data);
+      }
+
+      function loyaltyLifetimeBaseline() {
+        let current = loyaltyStampBaseline();
+        let stored = resource == null ? 0 : resource.data.get('lifetimeStamps', 0);
+        return stored is int && stored >= 0 && stored > current
+          ? stored
+          : current;
+      }
+
+      function loyaltyRedeemedBaseline() {
+        return resource == null ? 0 : oldRewardCount(resource.data);
+      }
+
+      function loyaltyEarnedBaseline() {
+        let earned = resource == null ? 0 : oldRewardEarnedCount(resource.data);
+        let redeemed = loyaltyRedeemedBaseline();
+        return earned > redeemed ? earned : redeemed;
+      }
+
+      function expectedRewardsEarnedAfterStamp(stampTarget) {
+        let before = loyaltyStampBaseline();
+        let earned = loyaltyEarnedBaseline();
+        let redeemed = loyaltyRedeemedBaseline();
+        let crossingThreshold = before < stampTarget && before + 1 >= stampTarget;
+        let repairingReadyLegacyReward = before >= stampTarget && earned == redeemed;
+        return crossingThreshold || repairingReadyLegacyReward
+          ? earned + 1
+          : earned;
+      }
+
+      function matchingStampTransaction(clientId, transactionId) {
+        return clientId is string
+          && clientId != ''
+          && transactionId is string
+          && transactionId != ''
+          && loyaltyStampBaseline() is int
+          && loyaltyStampBaseline() >= 0
+          && !exists(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(transactionId)
+          )
+          && existsAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(transactionId)
+          )
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(transactionId)
+          ).data.get('clientId', '') == clientId
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(transactionId)
+          ).data.get('customerId', '') == customerId
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(transactionId)
+          ).data.get('transactionId', '') == transactionId
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(transactionId)
+          ).data.get('type', '') == 'STAMP_ADDED'
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(transactionId)
+          ).data.get('staffId', '') == uid()
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(transactionId)
+          ).data.get('staffUid', '') == uid()
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(transactionId)
+          ).data.get('delta', 0) == 1
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(transactionId)
+          ).data.get('stampCountBefore', -1) == loyaltyStampBaseline()
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(transactionId)
+          ).data.get('stampCountAfter', -1) == loyaltyStampBaseline() + 1
+          && validStampTarget(
+            getAfter(
+              /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(transactionId)
+            ).data.get('stampTarget', 0)
+          )
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(transactionId)
+          ).data.get('rewardUnlocked', false)
+            == (
+              getAfter(
+                /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(transactionId)
+              ).data.get('stampCountAfter', -1)
+              >= getAfter(
+                /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(transactionId)
+              ).data.get('stampTarget', 0)
+            )
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(transactionId)
+          ).data.get('visitCounted', false) == true
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(transactionId)
+          ).data.get('visitCountedAt', null) == request.time
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(transactionId)
+          ).data.get('createdAt', null) == request.time;
+      }
+
+      function stampTransactionIdAfter() {
+        return getAfter(
+          /databases/$(database)/documents/customers/$(customerId)
+        ).data.get('lastVisitTransactionId', '');
+      }
+
+      function validStampAccountMutation(clientId) {
+        return existsAfter(
+          /databases/$(database)/documents/customers/$(customerId)
+        )
+        && getAfter(
+          /databases/$(database)/documents/customers/$(customerId)
+        ).data.get('clientId', '') == clientId
+        && stampTransactionIdAfter() is string
+        && stampTransactionIdAfter() != ''
+        && matchingStampTransaction(clientId, stampTransactionIdAfter());
+      }
+
+      function matchingRewardMutation(clientId, redemptionId) {
+        return redemptionId is string
+          && redemptionId != ''
+          && existsAfter(
+            /databases/$(database)/documents/clients/$(clientId)/rewardRedemptions/$(redemptionId)
+          )
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/rewardRedemptions/$(redemptionId)
+          ).data.get('clientId', '') == clientId
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/rewardRedemptions/$(redemptionId)
+          ).data.get('customerId', '') == customerId
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/rewardRedemptions/$(redemptionId)
+          ).data.get('transactionId', '') == redemptionId
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/rewardRedemptions/$(redemptionId)
+          ).data.get('staffUid', '') == uid()
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/rewardRedemptions/$(redemptionId)
+          ).data.get('staffId', '') == uid()
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/rewardRedemptions/$(redemptionId)
+          ).data.get('stampCost', 0) is int
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/rewardRedemptions/$(redemptionId)
+          ).data.get('stampCost', 0) >= 1
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/rewardRedemptions/$(redemptionId)
+          ).data.get('stampCost', 0) <= 30
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/rewardRedemptions/$(redemptionId)
+          ).data.get('stampsResetFrom', -1) == loyaltyStampBaseline()
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/rewardRedemptions/$(redemptionId)
+          ).data.get('stampsResetTo', -1)
+            == request.resource.data.get('currentStamps', -1)
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/rewardRedemptions/$(redemptionId)
+          ).data.get('stampsResetTo', -1)
+            == loyaltyStampBaseline()
+              - getAfter(
+                  /databases/$(database)/documents/clients/$(clientId)/rewardRedemptions/$(redemptionId)
+                ).data.get('stampCost', 0)
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/rewardRedemptions/$(redemptionId)
+          ).data.get('redeemedAt', null) == request.time
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/rewardRedemptions/$(redemptionId)
+          ).data.get('createdAt', null) == request.time
+          && existsAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(redemptionId)
+          )
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(redemptionId)
+          ).data.get('clientId', '') == clientId
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(redemptionId)
+          ).data.get('customerId', '') == customerId
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(redemptionId)
+          ).data.get('staffUid', '') == uid()
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(redemptionId)
+          ).data.get('staffId', '') == uid()
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(redemptionId)
+          ).data.get('type', '') == 'REWARD_REDEEMED'
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(redemptionId)
+          ).data.get('delta', 0)
+            == -getAfter(
+                 /databases/$(database)/documents/clients/$(clientId)/rewardRedemptions/$(redemptionId)
+               ).data.get('stampCost', 0)
+          && getAfter(
+            /databases/$(database)/documents/clients/$(clientId)/stampTransactions/$(redemptionId)
+          ).data.get('createdAt', null) == request.time;
+      }
+
+      // Only a valid final stamp transaction can create the first account.
+      allow create:
+        if signedIn()
+        && uid() != customerId
+        && isStaffOf(request.resource.data.get('clientId', ''))
+        && request.resource.data.keys().hasOnly([
+          'clientId',
+          'customerId',
+          'currentStamps',
+          'stamps',
+          'lifetimeStamps',
+          'rewardsEarned',
+          'rewardsRedeemed',
+          'totalRewardsEarned',
+          'totalRewardsRedeemed',
+          'stampTarget',
+          'rewardName',
+          'isEligibleForReward',
+          'lastStampAt',
+          'updatedAt'
+        ])
+        && request.resource.data.keys().hasAll([
+          'clientId',
+          'customerId',
+          'currentStamps',
+          'stamps',
+          'lifetimeStamps',
+          'rewardsEarned',
+          'rewardsRedeemed',
+          'totalRewardsEarned',
+          'totalRewardsRedeemed',
+          'stampTarget',
+          'rewardName',
+          'isEligibleForReward',
+          'lastStampAt',
+          'updatedAt'
+        ])
+        && request.resource.data.clientId is string
+        && request.resource.data.clientId != ''
+        && request.resource.data.customerId == customerId
+        && exists(
+          /databases/$(database)/documents/customers/$(customerId)
+        )
+        && get(
+          /databases/$(database)/documents/customers/$(customerId)
+        ).data.get('clientId', '') == request.resource.data.clientId
+        && request.resource.data.currentStamps is int
+        && request.resource.data.currentStamps == 1
+        && request.resource.data.stamps == request.resource.data.currentStamps
+        && request.resource.data.lifetimeStamps is int
+        && request.resource.data.lifetimeStamps >= 1
+        && request.resource.data.rewardsRedeemed is int
+        && request.resource.data.rewardsRedeemed >= 0
+        && request.resource.data.totalRewardsRedeemed == request.resource.data.rewardsRedeemed
+        && validStampTarget(request.resource.data.stampTarget)
+        && request.resource.data.rewardName is string
+        && request.resource.data.rewardName.size() > 0
+        && request.resource.data.rewardName.size() <= 120
+        && request.resource.data.isEligibleForReward
+          == (request.resource.data.currentStamps >= request.resource.data.stampTarget)
+        && request.resource.data.rewardsEarned is int
+        && request.resource.data.rewardsEarned
+          >= expectedRewardsEarnedAfterStamp(request.resource.data.stampTarget)
+        && request.resource.data.rewardsEarned >= request.resource.data.rewardsRedeemed
+        && request.resource.data.totalRewardsEarned == request.resource.data.rewardsEarned
+        && request.resource.data.lastStampAt == request.time
+        && request.resource.data.updatedAt == request.time
+        && validStampAccountMutation(request.resource.data.clientId);
+
+      // Normal stamps may only add one to the balance and lifetime history;
+      // a separate linked reward redemption may reset the current balance but
+      // can never reduce lifetimeStamps or rewardsEarned.
+      allow update:
+        if signedIn()
+        && uid() != customerId
+        && isStaffOf(resource.data.get('clientId', ''))
+        && request.resource.data.get('clientId', '') == resource.data.get('clientId', '')
+        && request.resource.data.customerId == customerId
+        && exists(
+          /databases/$(database)/documents/customers/$(customerId)
+        )
+        && get(
+          /databases/$(database)/documents/customers/$(customerId)
+        ).data.get('clientId', '') == resource.data.get('clientId', '')
+        && (
+          (
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'currentStamps',
+              'stamps',
+              'lifetimeStamps',
+              'rewardsEarned',
+              'rewardsRedeemed',
+              'totalRewardsEarned',
+              'totalRewardsRedeemed',
+              'stampTarget',
+              'rewardName',
+              'isEligibleForReward',
+              'lastStampAt',
+              'updatedAt'
+            ])
+            && loyaltyStampBaseline() is int
+            && loyaltyStampBaseline() >= 0
+            && request.resource.data.currentStamps is int
+            && request.resource.data.currentStamps == loyaltyStampBaseline() + 1
+            && request.resource.data.stamps == request.resource.data.currentStamps
+            && request.resource.data.lifetimeStamps is int
+            && request.resource.data.lifetimeStamps >= loyaltyLifetimeBaseline() + 1
+            && request.resource.data.lifetimeStamps >= request.resource.data.currentStamps
+            && request.resource.data.rewardsRedeemed is int
+            && request.resource.data.rewardsRedeemed >= loyaltyRedeemedBaseline()
+            && request.resource.data.totalRewardsRedeemed == request.resource.data.rewardsRedeemed
+            && request.resource.data.rewardsEarned is int
+            && request.resource.data.rewardsEarned
+              >= expectedRewardsEarnedAfterStamp(request.resource.data.stampTarget)
+            && request.resource.data.rewardsEarned >= request.resource.data.rewardsRedeemed
+            && request.resource.data.totalRewardsEarned == request.resource.data.rewardsEarned
+            && validStampTarget(request.resource.data.stampTarget)
+            && request.resource.data.rewardName is string
+            && request.resource.data.rewardName.size() > 0
+            && request.resource.data.rewardName.size() <= 120
+            && request.resource.data.isEligibleForReward
+              == (request.resource.data.currentStamps >= request.resource.data.stampTarget)
+            && request.resource.data.lastStampAt == request.time
+            && request.resource.data.updatedAt == request.time
+            && validStampAccountMutation(resource.data.get('clientId', ''))
+          )
+          || (
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'currentStamps',
+              'stamps',
+              'lifetimeStamps',
+              'rewardsEarned',
+              'rewardsRedeemed',
+              'totalRewardsEarned',
+              'totalRewardsRedeemed',
+              'isEligibleForReward',
+              'lastRewardRedeemedAt',
+              'lastRewardRedemptionId',
+              'updatedAt'
+            ])
+            && loyaltyStampBaseline() is int
+            && loyaltyStampBaseline() >= 1
+            && request.resource.data.currentStamps is int
+            && request.resource.data.currentStamps >= 0
+            && request.resource.data.stamps == request.resource.data.currentStamps
+            && request.resource.data.rewardsRedeemed is int
+            && request.resource.data.rewardsRedeemed >= loyaltyRedeemedBaseline() + 1
+            && request.resource.data.totalRewardsRedeemed == request.resource.data.rewardsRedeemed
+            && request.resource.data.rewardsEarned is int
+            && request.resource.data.rewardsEarned >= loyaltyEarnedBaseline()
+            && request.resource.data.rewardsEarned >= request.resource.data.rewardsRedeemed
+            && request.resource.data.totalRewardsEarned == request.resource.data.rewardsEarned
+            && request.resource.data.lifetimeStamps is int
+            && request.resource.data.lifetimeStamps >= loyaltyLifetimeBaseline()
+            && request.resource.data.lifetimeStamps >= request.resource.data.currentStamps
+            && request.resource.data.lastStampAt
+              == resource.data.get('lastStampAt', null)
+            && request.resource.data.updatedAt == request.time
+            && request.resource.data.get('lastRewardRedeemedAt', null) == request.time
+            && request.resource.data.get('lastRewardRedemptionId', '') is string
+            && request.resource.data.get('lastRewardRedemptionId', '') != ''
+            && matchingRewardMutation(
+              resource.data.get('clientId', ''),
+              request.resource.data.get('lastRewardRedemptionId', '')
+            )
+            && request.resource.data.isEligibleForReward
+              == (
+                request.resource.data.currentStamps
+                >= getAfter(
+                    /databases/$(database)/documents/clients/$(resource.data.get('clientId', ''))/rewardRedemptions/$(request.resource.data.get('lastRewardRedemptionId', ''))
+                  ).data.get('stampCost', 0)
+              )
+          )
+        );
+
     }
 
-    // ---------------------------------------------------------------- customers + loyalty
-    // Store-scoped PII. Queries MUST pin where("clientId","==",X).
-    match /customers/{id} {
-      allow read: if isSignedIn() && (canManage(resource.data.clientId) || isStaffOf(resource.data.clientId));
-      allow create: if isSignedIn() && isValidClientId(request.resource.data.clientId)
-        && (canManage(request.resource.data.clientId) || isStaffOf(request.resource.data.clientId));
-      allow update: if isSignedIn() && (canManage(resource.data.clientId) || isStaffOf(resource.data.clientId))
-        && unchanged('clientId'); // a customer can never be re-homed to another store
-      allow delete: if isSuperAdmin();
-    }
-    match /loyaltyAccounts/{id} {
-      // Balances change only through staff/admin counter operations — never by the customer's browser.
-      allow read: if isSignedIn() && (canManage(resource.data.clientId) || isStaffOf(resource.data.clientId));
-      allow create: if isSignedIn() && isValidClientId(request.resource.data.clientId)
-        && (canManage(request.resource.data.clientId) || isStaffOf(request.resource.data.clientId));
-      allow update: if isSignedIn() && (canManage(resource.data.clientId) || isStaffOf(resource.data.clientId))
-        && unchanged('clientId') && unchanged('customerId');
-      allow delete: if false;
+    // ============================================================
+    // CUSTOMERS
+    // ============================================================
+
+    match /customers/{customerId} {
+
+      function d() {
+        return request.resource.data;
+      }
+
+      function changed() {
+        return d().diff(resource.data).affectedKeys();
+      }
+
+      function oldVisits() {
+        return resource.data.get(
+          'totalVisits',
+          0
+        ) is int
+          ? resource.data.get('totalVisits', 0)
+          : 0;
+      }
+
+      function ownsIndexAfter(
+        indexId,
+        clientId,
+        phone
+      ) {
+        return getAfter(
+          /databases/$(database)/documents/customerPhoneIndex/$(indexId)
+        ).data.customerId == customerId
+          && getAfter(
+            /databases/$(database)/documents/customerPhoneIndex/$(indexId)
+          ).data.phone == phone
+          && getAfter(
+            /databases/$(database)/documents/customerPhoneIndex/$(indexId)
+          ).data.clientId == clientId;
+      }
+
+      function visitTx(txId) {
+        return /databases/$(database)/documents/clients/$(resource.data.clientId)/stampTransactions/$(txId);
+      }
+
+      function visitTxAfterBelongsToCustomer(txId) {
+        return txId is string
+        && txId != ''
+        && !exists(visitTx(txId))
+        && existsAfter(visitTx(txId))
+        && getAfter(visitTx(txId)).data.get('customerId', '') == customerId
+        && getAfter(visitTx(txId)).data.get('clientId', '') == resource.data.clientId
+        && getAfter(visitTx(txId)).data.get('transactionId', '') == txId
+        && getAfter(visitTx(txId)).data.get('type', '') == 'STAMP_ADDED'
+        && getAfter(visitTx(txId)).data.get('staffId', '') == uid()
+        && getAfter(visitTx(txId)).data.get('staffUid', '') == uid()
+        && getAfter(visitTx(txId)).data.get('delta', 0) == 1
+        && getAfter(visitTx(txId)).data.get('visitCounted', false) == true
+        && getAfter(visitTx(txId)).data.get('visitCountedAt', null) == request.time
+        && getAfter(visitTx(txId)).data.get('createdAt', null) == request.time;
+      }
+
+      // ----------------------------------------------------------
+      // Customer own document
+      // ----------------------------------------------------------
+
+      allow get:
+        if signedIn()
+        && uid() == customerId;
+
+      // Staff/admin own business.
+      allow get:
+        if isStaffOf(
+          resource.data.get('clientId', '')
+        );
+
+      allow list:
+        if staffClientId() != ''
+        && resource.data.clientId == staffClientId();
+
+      // ----------------------------------------------------------
+      // CUSTOMER REGISTRATION
+      // ----------------------------------------------------------
+
+      allow create:
+        if signedIn()
+        && uid() == customerId
+
+        && d().keys().hasOnly([
+          'uid',
+          'clientId',
+          'name',
+          'phone',
+          'normalizedPhone',
+          'phoneIndexId',
+          'email',
+          'totalVisits',
+          'lastVisitAt',
+          'status',
+          'createdAt',
+          'updatedAt',
+          'qrToken'
+        ])
+
+        && d().keys().hasAll([
+          'uid',
+          'clientId',
+          'name',
+          'phone',
+          'normalizedPhone',
+          'phoneIndexId',
+          'email',
+          'totalVisits',
+          'lastVisitAt',
+          'status',
+          'createdAt',
+          'updatedAt',
+          'qrToken'
+        ])
+
+        && d().uid == customerId
+        && d().status == 'active'
+        && d().totalVisits == 0
+        && d().lastVisitAt == null
+
+        && validName(d().name)
+
+        && validPhone(d().normalizedPhone)
+        && d().phone == d().normalizedPhone
+
+        && validEmail(
+          d().get('email', null)
+        )
+
+        && clientIsPublic(
+          d().clientId
+        )
+
+        && d().phoneIndexId
+          == phoneKey(
+            d().clientId,
+            d().normalizedPhone
+          )
+
+        && ownsIndexAfter(
+          d().phoneIndexId,
+          d().clientId,
+          d().normalizedPhone
+        )
+
+        && tokenAfterMatches(
+          d().qrToken,
+          customerId,
+          d().clientId
+        )
+
+        && d().createdAt == request.time
+        && d().updatedAt == request.time;
+
+      // ----------------------------------------------------------
+      // CUSTOMER PROFILE UPDATE
+      // ----------------------------------------------------------
+
+      allow update:
+        if signedIn()
+        && uid() == customerId
+
+        && changed().hasOnly([
+          'name',
+          'phone',
+          'normalizedPhone',
+          'phoneIndexId',
+          'email',
+          'updatedAt',
+          'qrToken'
+        ])
+
+        && d().updatedAt == request.time
+
+        && validName(d().name)
+
+        && validEmail(
+          d().get('email', null)
+        )
+
+        // Phone change requires atomic phone index movement.
+        && (
+          !changed().hasAny([
+            'phone',
+            'normalizedPhone',
+            'phoneIndexId'
+          ])
+
+          || (
+            validPhone(d().normalizedPhone)
+            && d().phone == d().normalizedPhone
+            && d().phoneIndexId
+              == phoneKey(
+                resource.data.clientId,
+                d().normalizedPhone
+              )
+
+            && ownsIndexAfter(
+              d().phoneIndexId,
+              resource.data.clientId,
+              d().normalizedPhone
+            )
+
+            && (
+              resource.data.get(
+                'phoneIndexId',
+                null
+              ) == null
+
+              || resource.data.phoneIndexId
+                == d().phoneIndexId
+
+              || !existsAfter(
+                /databases/$(database)/documents/customerPhoneIndex/$(resource.data.phoneIndexId)
+              )
+            )
+          )
+        )
+
+        // QR token can only be added once.
+        && (
+          !changed().hasAny(['qrToken'])
+          || (
+            !('qrToken' in resource.data)
+            && tokenAfterMatches(
+              d().qrToken,
+              customerId,
+              resource.data.clientId
+            )
+          )
+        );
+
+      // ----------------------------------------------------------
+      // STAFF VISIT COUNTING
+      // ----------------------------------------------------------
+
+      allow update:
+        if signedIn()
+        && uid() != customerId
+        && isStaffOf(resource.data.get('clientId', ''))
+        && d().get('clientId', '') == resource.data.get('clientId', '')
+        && d().get('uid', customerId) == resource.data.get('uid', customerId)
+        && changed().hasOnly([
+          'totalVisits',
+          'lastVisitAt',
+          'updatedAt',
+          'lastVisitTransactionId'
+        ])
+        && changed().hasAll([
+          'totalVisits',
+          'lastVisitAt',
+          'updatedAt',
+          'lastVisitTransactionId'
+        ])
+        && d().totalVisits is int
+        && d().totalVisits == oldVisits() + 1
+        && d().lastVisitAt == request.time
+        && d().updatedAt == request.time
+        && visitTxAfterBelongsToCustomer(d().lastVisitTransactionId);
     }
 
-    // ---------------------------------------------------------------- audit trail (immutable)
+    // ============================================================
+    // CUSTOMER PHONE INDEX
+    // ============================================================
+
+    match /customerPhoneIndex/{phoneIndexId} {
+
+      function d() {
+        return request.resource.data;
+      }
+
+      function ownerAfter() {
+        return getAfter(
+          /databases/$(database)/documents/customers/$(uid())
+        ).data;
+      }
+
+      // Owner only.
+      allow get:
+        if signedIn()
+        && resource.data.customerId == uid();
+
+      // Staff/admin only for their business.
+      allow get:
+        if isStaffOf(
+          resource.data.get('clientId', '')
+        );
+
+      // ----------------------------------------------------------
+      // CREATE
+      // ----------------------------------------------------------
+
+      allow create:
+        if signedIn()
+
+        && d().keys().hasOnly([
+          'phone',
+          'clientId',
+          'customerId',
+          'createdAt',
+          'updatedAt'
+        ])
+
+        && d().customerId == uid()
+
+        && validPhone(d().phone)
+
+        && clientIsPublic(
+          d().clientId
+        )
+
+        && phoneIndexId
+          == phoneKey(
+            d().clientId,
+            d().phone
+          )
+
+        && ownerAfter().phoneIndexId
+          == phoneIndexId
+
+        && ownerAfter().normalizedPhone
+          == d().phone
+
+        && ownerAfter().clientId
+          == d().clientId
+
+        && d().createdAt == request.time
+        && d().updatedAt == request.time;
+
+      // ----------------------------------------------------------
+      // DELETE DURING ATOMIC PHONE CHANGE
+      // ----------------------------------------------------------
+
+      allow delete:
+        if signedIn()
+        && resource.data.customerId == uid()
+        && ownerAfter().get(
+          'phoneIndexId',
+          ''
+        ) != phoneIndexId;
+    }
+
+    // ============================================================
+    // CUSTOMER QR TOKENS
+    // ============================================================
+
+    match /customerTokens/{token} {
+
+      // Created atomically with customers/{uid}.
+      allow create:
+        if signedIn()
+
+        && token.matches(
+          '^[a-f0-9]{64}$'
+        )
+
+        && request.resource.data.keys().hasOnly([
+          'customerId',
+          'clientId',
+          'createdAt'
+        ])
+
+        && request.resource.data.customerId == uid()
+
+        && request.resource.data.clientId is string
+        && request.resource.data.clientId != ''
+
+        && getAfter(
+          /databases/$(database)/documents/customers/$(uid())
+        ).data.qrToken == token
+
+        && getAfter(
+          /databases/$(database)/documents/customers/$(uid())
+        ).data.clientId
+          == request.resource.data.clientId
+
+        && request.resource.data.createdAt
+          == request.time;
+
+      // Customer can read own QR token.
+      allow get:
+        if signedIn()
+        && resource.data.customerId == uid();
+
+      // Staff can resolve QR only for their own business.
+      allow get:
+        if isStaffOf(
+          resource.data.get('clientId', '')
+        );
+    }
+
+    // ============================================================
+    // ============================================================
+    // ACTIVITY LOG — append-only audit trail (admin app)
+    // ============================================================
     match /activityLogs/{id} {
-      allow read: if isSuperAdmin() || (isActiveAdmin() && canManage(resource.data.clientId));
-      allow create: if isSignedIn()
-        && request.resource.data.actorUid == uid(); // an actor can only log as themselves
+      allow read: if isSuperAdmin()
+        || (isActiveAdmin() && canManage(resource.data.get('clientId', '')));
+      allow create: if signedIn()
+        && request.resource.data.get('actorUid', '') == uid(); // an actor can only log as themselves
       allow update, delete: if false;
     }
 
-    // ---------------------------------------------------------------- analytics counters
-    // Customer App records events unauthenticated via blind merge. Validated:
-    // only known counter fields, only increments from a known store id.
+    // ============================================================
+    // ANALYTICS COUNTERS — blind daily counters (customer app)
+    // ============================================================
     match /metricsDaily/{id} {
-      allow read: if isSuperAdmin() || (isActiveAdmin() && canManage(resource.data.clientId));
-      allow create, update: if isValidClientId(request.resource.data.clientId)
-        && id == request.resource.data.clientId + '_' + request.resource.data.day
+      allow read: if isSuperAdmin()
+        || (isActiveAdmin() && canManage(resource.data.get('clientId', '')));
+      allow create, update: if request.resource.data.get('clientId', '') is string
+        && request.resource.data.clientId.size() > 0
+        && request.resource.data.clientId.size() < 64
+        && id == request.resource.data.clientId + '_' + request.resource.data.get('day', '')
         && exists(/databases/$(database)/documents/clients/$(request.resource.data.clientId))
         && request.resource.data.keys().hasOnly([
              'clientId', 'day', 'qrScans', 'menuViews', 'googleReviews', 'socialClicks',
@@ -206,5 +2096,6 @@ service cloud.firestore {
         && (!('feedback' in request.resource.data) || request.resource.data.feedback is int);
       allow delete: if false;
     }
+
   }
 }
