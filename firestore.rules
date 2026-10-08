@@ -8,7 +8,8 @@ rules_version = '2';
 //   clients/{clientId}               store doc with embedded theme/loyalty/wifi/aiReview
 //     /menuCategories, /menuItems, /qrConfigurations, /rewards   (public read)
 //     /stampTransactions, /rewardRedemptions                    (append-only)
-//     /reviews, /feedback                                       (public create)
+//     /reviews                                                  (public create · Google/AI copies)
+//     /feedback   public create · THE ONLY customer rating source (rating 1..5|null)
 //     /aiUsage
 //   staffUsers/{uid}  customers/{id}  loyaltyAccounts/{customerId}
 //   activityLogs/{id} (immutable)     metricsDaily/{clientId_day}
@@ -50,6 +51,22 @@ service cloud.firestore {
 
     function isValidClientId(id) { return id is string && id.size() > 0 && id.size() < 64; }
     function unchanged(field) { return request.resource.data[field] == resource.data[field]; }
+
+    /**
+     * Feedback moderation may never rewrite what the guest submitted.
+     * True when the field is absent both before and after the write, or when it
+     * is present with an identical value — an admin cannot add a rating the
+     * customer never gave, nor invent a reply author.
+     */
+    function feedbackImmutable(field) {
+      return (!(field in resource.data) && !(field in request.resource.data))
+        || ((field in resource.data) && (field in request.resource.data)
+            && request.resource.data[field] == resource.data[field]);
+    }
+    /** A stored reply: null/absent, or a non-empty string within the 2000-char cap. */
+    function validFeedbackReply(value) {
+      return value == null || (value is string && value.size() > 0 && value.size() <= 2000);
+    }
 
     // ---------------------------------------------------------------- admins
     match /admins/{adminId} {
@@ -127,15 +144,69 @@ service cloud.firestore {
           && unchanged('rating') && unchanged('createdAt'); // admins moderate, never rewrite the customer's rating
         allow delete: if false;
       }
+      // -- customer feedback: the canonical, anonymous feedback + RATING source.
+      //    Writes by guests are schema-validated; reading, moderating and
+      //    replying is limited to an active admin of THIS store (canManage never
+      //    includes staff or customers, so a guest can never mark/archive/reply).
       match /feedback/{id} {
         allow read: if canManage(clientId);
-        // Anonymous by design — the schema holds no identity fields and none may be added.
+
+        // Canonical schema written by the Customer App:
+        //   { clientId, rating: 1..5|null, message, source: 'customer_feedback',
+        //     status: 'new', adminReply/aiReply/repliedAt/repliedBy: null,
+        //     createdAt, updatedAt }
+        // Older documents (sentiment, status 'NEW', no rating) stay readable and
+        // a legacy guest client can still submit. No identity field is allowed.
         allow create: if request.resource.data.clientId == clientId
           && request.resource.data.message is string
           && request.resource.data.message.size() > 0
           && request.resource.data.message.size() <= 2000
-          && request.resource.data.keys().hasOnly(['clientId', 'message', 'sentiment', 'status', 'createdAt']);
-        allow update: if canManage(clientId) && unchanged('message') && unchanged('createdAt');
+          && (!('rating' in request.resource.data)
+              || request.resource.data.rating == null
+              || (request.resource.data.rating is int
+                  && request.resource.data.rating >= 1
+                  && request.resource.data.rating <= 5))
+          && (!('source' in request.resource.data) || request.resource.data.source == 'customer_feedback')
+          && (!('status' in request.resource.data) || request.resource.data.status in ['new', 'NEW'])
+          && (!('adminReply' in request.resource.data) || request.resource.data.adminReply == null)
+          && (!('aiReply' in request.resource.data) || request.resource.data.aiReply == null)
+          && (!('repliedAt' in request.resource.data) || request.resource.data.repliedAt == null)
+          && (!('repliedBy' in request.resource.data) || request.resource.data.repliedBy == null)
+          && (!('sentiment' in request.resource.data)
+              || (request.resource.data.sentiment is string && request.resource.data.sentiment.size() <= 40))
+          && request.resource.data.keys().hasOnly([
+               'clientId', 'rating', 'message', 'source', 'status',
+               'adminReply', 'aiReply', 'repliedAt', 'repliedBy',
+               'createdAt', 'updatedAt', 'sentiment'
+             ]);
+
+        // Admin moderation (status: new → reviewed → archived) and replies.
+        // message / rating / source / createdAt / clientId are immutable, so a
+        // reply can never overwrite the customer's words or their star rating,
+        // and repliedBy can only ever be the acting admin's own uid.
+        allow update: if canManage(clientId)
+          && feedbackImmutable('clientId')
+          && feedbackImmutable('message')
+          && feedbackImmutable('rating')
+          && feedbackImmutable('source')
+          && feedbackImmutable('createdAt')
+          && feedbackImmutable('sentiment')
+          && request.resource.data.get('status', 'new') in ['new', 'NEW', 'reviewed', 'REVIEWED', 'archived', 'ARCHIVED']
+          && validFeedbackReply(request.resource.data.get('adminReply', null))
+          && validFeedbackReply(request.resource.data.get('aiReply', null))
+          && (!('repliedAt' in request.resource.data)
+              || request.resource.data.repliedAt == null
+              || request.resource.data.repliedAt is timestamp)
+          && (!('repliedBy' in request.resource.data)
+              || request.resource.data.repliedBy == null
+              || request.resource.data.repliedBy == uid())
+          && (!('updatedAt' in request.resource.data) || request.resource.data.updatedAt is timestamp)
+          && request.resource.data.keys().hasOnly([
+               'clientId', 'rating', 'message', 'source', 'status',
+               'adminReply', 'aiReply', 'repliedAt', 'repliedBy',
+               'createdAt', 'updatedAt', 'sentiment'
+             ]);
+        // Archived feedback is never deleted — it stays available in the ARCHIVED filter.
         allow delete: if false;
       }
       match /aiUsage/{month} {

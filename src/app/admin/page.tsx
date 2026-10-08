@@ -32,10 +32,11 @@ import { useAuth } from "@/context/AuthContext";
 import {
   activityService,
   clientService,
+  feedbackService,
   menuService,
   metricsService,
-  reviewService,
 } from "@/lib/firebase/services";
+import { VALID_RATINGS, computeRatingSummary, formatCount } from "@/lib/feedback";
 import { seedDemoClients } from "@/lib/firebase/seed";
 import { useLoad, runOp } from "@/lib/use-load";
 import type { Actor, ClientDoc } from "@/lib/firebase/types";
@@ -191,15 +192,16 @@ function DashboardBody({
   const active = client;
   const dataLoad = useLoad(
     async () => {
-      const [stats, series, items, reviews, recent, settings] = await Promise.all([
+      // Ratings come from clients/{clientId}/feedback ONLY — see computeRatingSummary.
+      const [stats, series, items, feedback, recent, settings] = await Promise.all([
         clientService.stats(active.id),
         metricsService.series(active.id, range),
         menuService.items(active.id),
-        reviewService.list(active.id),
+        feedbackService.list(active.id),
         activityService.forClient(active.id),
         clientService.get(active.id).then((r) => r?.settings ?? null),
       ]);
-      return { stats, series, items, reviews, recent: recent.slice(0, 6), settings };
+      return { stats, series, items, feedback, recent: recent.slice(0, 6), settings };
     },
     [active.id, range],
   );
@@ -226,9 +228,9 @@ function DashboardBody({
 
   const scanSeries = (d?.series ?? []).slice(-14);
   const topItems = [...(d?.items ?? [])].sort((a, b) => b.views - a.views).slice(0, 5);
-  const reviews = d?.reviews ?? [];
-  const avgRating = reviews.length ? (reviews.reduce((a, r) => a + r.rating, 0) / reviews.length).toFixed(1) : "—";
-  const buckets = [5, 4, 3, 2, 1].map((star) => ({ star, count: reviews.filter((r) => r.rating === star).length }));
+  // ONE rating source (feedback.rating). Guards live in computeRatingSummary:
+  // with no valid ratings the average renders "—" and can never be NaN.
+  const ratingSummary = computeRatingSummary(d?.feedback ?? []);
 
   return (
     <>
@@ -357,15 +359,21 @@ function DashboardBody({
             <Card className="p-5">
               <SectionTitle>Review statistics</SectionTitle>
               <div className="mb-3 flex items-end gap-3">
-                <p className="display-num text-[40px] text-espresso">{avgRating}</p>
+                <p className="display-num text-[40px] text-espresso">{ratingSummary.averageText}</p>
                 <div className="pb-1.5">
                   <p className="label-caps">Average rating</p>
-                  <p className="text-[11px] text-mocha">{reviews.length} reviews</p>
+                  <p className="text-[11px] text-mocha">{ratingSummary.totalRated} rated reviews</p>
                 </div>
               </div>
               <div className="space-y-2">
-                {buckets.map((b) => (
-                  <MeterBar key={b.star} label={`${b.star} ★`} value={b.count} max={Math.max(1, reviews.length)} right={String(b.count)} />
+                {VALID_RATINGS.map((star) => (
+                  <MeterBar
+                    key={star}
+                    label={`${star} ★`}
+                    value={ratingSummary.counts[star]}
+                    max={Math.max(1, ratingSummary.totalRated)}
+                    right={formatCount(ratingSummary.counts[star])}
+                  />
                 ))}
               </div>
             </Card>

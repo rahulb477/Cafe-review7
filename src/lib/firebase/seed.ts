@@ -1,4 +1,4 @@
-import { writeBatch } from "firebase/firestore";
+import { Timestamp, writeBatch } from "firebase/firestore";
 import { COL, db, newId, subDoc } from "./firestore";
 import { doc } from "firebase/firestore";
 import { clientService } from "@/services/firebase/clientService";
@@ -215,17 +215,29 @@ export async function seedDemoClients(actor: Actor): Promise<string[]> {
         createdAt: now() - i * 3 * 864e5,
       });
     });
-    ["Play more jazz in the evenings!", "A sugar-free cold coffee option would be lovely.", "The corner table wobbles."].forEach(
-      (message, i) => {
-        batch.set(subDoc(clientId, "feedback", newId("fbk")), {
-          clientId,
-          message,
-          sentiment: i === 2 ? "NEGATIVE" : i === 0 ? "POSITIVE" : "NEUTRAL",
-          status: "NEW",
-          createdAt: now() - i * 4 * 864e5,
-        });
-      },
-    );
+    // Canonical Customer Feedback schema — the SAME document shape the customer
+    // app writes (and the only ratings source the admin console aggregates).
+    // Demo ratings: 5, text-only (null), 3.
+    [
+      ["Play more jazz in the evenings!", 5],
+      ["A sugar-free cold coffee option would be lovely.", null],
+      ["The corner table wobbles.", 3],
+    ].forEach(([message, rating], i) => {
+      const at = Timestamp.fromMillis(now() - i * 4 * 864e5);
+      batch.set(subDoc(clientId, "feedback", newId("fbk")), {
+        clientId,
+        rating,
+        message,
+        source: "customer_feedback",
+        status: "new",
+        adminReply: null,
+        aiReply: null,
+        repliedAt: null,
+        repliedBy: null,
+        createdAt: at,
+        updatedAt: at,
+      });
+    });
 
     // table QRs
     [1, 2, 3].forEach((t) => {

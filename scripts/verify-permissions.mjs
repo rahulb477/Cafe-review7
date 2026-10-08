@@ -25,7 +25,8 @@ const MATRIX = [
   ["clients", "public (customer app)", "active admin, not MANAGER", "canManage", "never"],
   ["clients/menuCategories,menuItems,qrConfigurations,rewards", "public", "canManage", "canManage", "canManage"],
   ["clients/stampTransactions,rewardRedemptions", "canOperate", "canOperate", "never (append-only)", "never"],
-  ["clients/reviews,feedback", "canManage", "public (customer submits)", "canManage", "never"],
+  ["clients/reviews", "canManage", "public (customer submits)", "canManage", "never"],
+  ["clients/feedback (rating source)", "canManage (admin of the store only)", "public create (schema-validated, anonymous)", "canManage — message/rating/createdAt immutable", "never"],
   ["clients/aiUsage", "canManage", "canManage", "canManage", "never"],
   ["staffUsers", "self / SUPER / canManage(primary clientId)", "canManage", "canManage", "canManage"],
   ["customers,loyaltyAccounts", "canManage or isStaffOf (store-scoped)", "same", "same", "SUPER / never"],
@@ -58,7 +59,22 @@ check("diagnostic never deletes clients/{id}", !readFileSync("src/components/con
 check("no dead admins array-contains query", !code.includes("adminsForClient"));
 check("metrics writes schema-validated (hasOnly + int + id match + store exists)", rules.includes("keys().hasOnly([") && rules.includes("id == request.resource.data.clientId + '_' + request.resource.data.day") && rules.includes("exists(/databases/$(database)/documents/clients/$(request.resource.data.clientId))"));
 check("reviews create validated; admin cannot rewrite rating", rules.includes("request.resource.data.rating >= 1 && request.resource.data.rating <= 5") && rules.includes("unchanged('rating')"));
-check("feedback stays anonymous (hasOnly, no identity fields)", rules.includes("hasOnly(['clientId', 'message', 'sentiment', 'status', 'createdAt'])"));
+check(
+  "feedback stays anonymous (canonical hasOnly, no identity fields)",
+  /hasOnly\(\s*\[\s*'clientId',\s*'rating',\s*'message',\s*'source',\s*'status',\s*'adminReply',\s*'aiReply',\s*'repliedAt',\s*'repliedBy',\s*'createdAt',\s*'updatedAt',\s*'sentiment'\s*\]\s*\)/.test(rules),
+);
+check(
+  "feedback rating/message immutable on moderation; reply author is the acting admin",
+  rules.includes("feedbackImmutable('rating')")
+    && rules.includes("feedbackImmutable('message')")
+    && rules.includes("request.resource.data.repliedBy == uid()"),
+);
+check(
+  "feedback create accepts the canonical schema (rating 1..5 or null)",
+  rules.includes("request.resource.data.rating >= 1")
+    && rules.includes("request.resource.data.rating <= 5")
+    && rules.includes("request.resource.data.source == 'customer_feedback'"),
+);
 check("staff cannot be re-homed; customers cannot be re-homed", (rules.match(/unchanged\('clientId'\)/g) || []).length >= 3);
 check("activity logs: actor can only log as self", rules.includes("request.resource.data.actorUid == uid()"));
 check("wifi password never in public doc (app never writes wifiPsk)", !code.includes("wifiPsk") && !code.includes("wifiPassword"));

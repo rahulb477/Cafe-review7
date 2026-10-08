@@ -190,13 +190,36 @@ export type ReviewDoc = {
   createdAt: number;
 };
 
+/**
+ * clients/{clientId}/feedback/{feedbackId} — the canonical Customer Feedback
+ * schema, written anonymously by the Customer App and read by the Admin App.
+ *
+ * THE ONLY rating source for the admin console: `rating`.
+ * Timestamps are stored as Firestore timestamps (serverTimestamp()); the types
+ * below are deliberately permissive because documents created before this
+ * schema existed are still readable (serialized timestamps, numeric-string
+ * ratings, missing reply fields, legacy `sentiment`).
+ */
+export type FeedbackStatus = "new" | "reviewed" | "archived";
+
 export type FeedbackDoc = {
   id: string;
   clientId: string;
-  message: string;
-  sentiment: "POSITIVE" | "NEUTRAL" | "NEGATIVE";
-  status: "NEW" | "REVIEWED" | "ARCHIVED";
-  createdAt: number;
+  message: string | null;
+  /** 1–5, or null for text-only feedback. Legacy documents may hold "5". */
+  rating: number | string | null;
+  source: string;
+  /** Canonical lowercase; legacy documents may hold "NEW". */
+  status: string;
+  adminReply: string | null;
+  aiReply: string | null;
+  /** Firestore Timestamp | {seconds,nanoseconds} | ISO string | epoch | null. */
+  repliedAt: unknown;
+  repliedBy: string | null;
+  createdAt: unknown;
+  updatedAt: unknown;
+  /** Legacy pre-rating field kept for backward-compatible reads only. */
+  sentiment?: string | null;
 };
 
 export type AiUsageDoc = {

@@ -15,7 +15,8 @@ import {
   StatTile,
 } from "@/components/ui";
 import { BarChart } from "@/components/interactive";
-import { menuService, metricsService, reviewService } from "@/lib/firebase/services";
+import { menuService, metricsService, feedbackService } from "@/lib/firebase/services";
+import { VALID_RATINGS, computeRatingSummary, formatCount } from "@/lib/feedback";
 import { useLoad } from "@/lib/use-load";
 
 export default function AnalyticsPage({ params }: { params: Promise<{ clientId: string }> }) {
@@ -53,12 +54,13 @@ function Analytics({ ctx }: { ctx: ClientCtx }) {
 
   const load = useLoad(
     async () => {
-      const [series, items, reviews] = await Promise.all([
+      // Ratings are aggregated from clients/{clientId}/feedback ONLY.
+      const [series, items, feedback] = await Promise.all([
         metricsService.series(client.id, range),
         menuService.items(client.id),
-        reviewService.list(client.id),
+        feedbackService.list(client.id),
       ]);
-      return { series: series as MetricRow[], items, reviews };
+      return { series: series as MetricRow[], items, feedback };
     },
     [client.id, range],
   );
@@ -68,11 +70,10 @@ function Analytics({ ctx }: { ctx: ClientCtx }) {
 
   const series = load.data?.series ?? [];
   const items = load.data?.items ?? [];
-  const reviews = load.data?.reviews ?? [];
+  const ratingSummary = computeRatingSummary(load.data?.feedback ?? []);
   const totals = Object.fromEntries(METRIC_LABELS.map(([k]) => [k, series.reduce((a, m) => a + (m[k] as number), 0)]));
   const topMenu = [...items].sort((a, b) => b.views - a.views).slice(0, 5);
   const label = (day: string) => new Date(day).toLocaleDateString("en-IN", { day: "numeric", month: "short" });
-  const buckets = [5, 4, 3, 2, 1].map((star) => ({ star, count: reviews.filter((r) => r.rating === star).length }));
 
   return (
     <>
@@ -182,17 +183,23 @@ function Analytics({ ctx }: { ctx: ClientCtx }) {
           <Card className="p-5">
             <SectionTitle>Rating spread</SectionTitle>
             <div className="space-y-3">
-              {buckets.map((b) => (
-                <MeterBar key={b.star} label={`${b.star} ★`} value={b.count} max={Math.max(1, reviews.length)} right={String(b.count)} />
+              {VALID_RATINGS.map((star) => (
+                <MeterBar
+                  key={star}
+                  label={`${star} ★`}
+                  value={ratingSummary.counts[star]}
+                  max={Math.max(1, ratingSummary.totalRated)}
+                  right={formatCount(ratingSummary.counts[star])}
+                />
               ))}
             </div>
           </Card>
           <Card className="p-5">
             <SectionTitle>Review totals</SectionTitle>
-            <p className="display-num text-[52px] leading-none text-espresso">
-              {reviews.length ? (reviews.reduce((a, r) => a + r.rating, 0) / reviews.length).toFixed(1) : "—"}
+            <p className="display-num text-[52px] leading-none text-espresso">{ratingSummary.averageText}</p>
+            <p className="label-caps mt-1">
+              {formatCount(ratingSummary.totalRated)} rated · {formatCount(ratingSummary.totalTextOnly)} text-only · {totals.googleReviews ?? 0} via Google metric
             </p>
-            <p className="label-caps mt-1">{reviews.length} reviews · {totals.googleReviews ?? 0} via Google metric</p>
           </Card>
         </div>
       ) : null}
