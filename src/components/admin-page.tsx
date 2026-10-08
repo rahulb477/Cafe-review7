@@ -13,6 +13,14 @@ export type ClientCtx = {
   role: string;
   client: ClientDoc;
   settings: ClientSettingsDoc;
+  /**
+   * The admin's CANONICAL store id, resolved from admins/{uid}.clientId by the
+   * auth layer (never from the browser). null for SUPER_ADMIN, who may operate
+   * on any store. Tenant-scoped writes use `storeId ?? client.id`, and the
+   * route clientId only ever reaches this point after useAdminGuard() has
+   * confirmed it belongs to this admin.
+   */
+  storeId: string | null;
   reloadClient: () => void;
 };
 
@@ -123,7 +131,14 @@ export function ClientPage({
       ) : !data?.client || !data.settings ? (
         <ErrorState message="This store (or its settings document) was not found in Firestore." />
       ) : (
-        children({ actor, role: admin.role, client: data.client, settings: data.settings, reloadClient: reload })
+        children({
+          actor,
+          role: admin.role,
+          client: data.client,
+          settings: data.settings,
+          storeId: guard.storeId ?? clientId,
+          reloadClient: reload,
+        })
       )}
     </AdminShell>
   );

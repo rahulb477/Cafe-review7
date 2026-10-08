@@ -7,6 +7,7 @@
     "start": "next start",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
+    "test:feedback": "node --test tests/feedback-ratings.test.mjs",
     "test:rules": "firebase emulators:exec --only firestore --project cafe-review7 \"node --test tests/firestore.rules.test.mjs\"",
     "verify": "node scripts/verify-navigation.mjs && node scripts/verify-permissions.mjs && node scripts/verify-publish-flow.mjs && node scripts/verify-responsive.mjs && node scripts/verify-store-setup.mjs",
     "deploy:rules": "firebase deploy --only firestore:rules,database --project cafe-review7"

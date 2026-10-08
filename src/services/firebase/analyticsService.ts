@@ -3,7 +3,10 @@ import { doc, increment, setDoc, updateDoc } from "firebase/firestore";
 import { getFirebaseApp } from "./firebaseClient";
 import { COL, SUB, create, createSub, db, getById, getSub, listByClient, listSub, patch, patchSub } from "@/lib/firebase/firestore";
 import type { Actor, AiUsageDoc, MetricDoc, ReviewDoc } from "@/lib/firebase/types";
+import type { FeedbackRecord } from "@/lib/feedback";
+import { draftFeedbackReplyText } from "@/lib/feedback-reply";
 import { activityService } from "./activityService";
+import { feedbackService } from "./reviewService";
 
 const dayKey = (offset = 0) => {
   const d = new Date();
@@ -151,6 +154,31 @@ export const aiService = {
     await patchSub(clientId, SUB.reviews, review.id, { content, source: "AI" });
     await activityService.log(actor, clientId, "AI_REVIEW_GENERATED", review.id);
     return content;
+  },
+
+  /**
+   * Draft a reply for ONE customer feedback document (clients/{clientId}/feedback).
+   *
+   *   feedback → generate draft → stored as `feedback.aiReply`
+   *            → admin reviews/edits → saveReply() → `feedback.adminReply`
+   *
+   * The draft never replaces the customer's message or rating, and it is never
+   * promoted to the final reply automatically. Uses the existing local AI
+   * integration, so no paid provider is required; the manual reply path in
+   * FeedbackReplyEditor keeps working when AI is switched off or fails.
+   */
+  async generateFeedbackReply(
+    actor: Actor,
+    clientId: string,
+    feedback: Pick<FeedbackRecord, "id" | "rating" | "message">,
+    settings: { aiEnabled: boolean; aiMonthlyLimit: number; aiPrice: number },
+  ) {
+    const status = await this.status(clientId, settings);
+    if (!status.enabled) throw new Error("AI review writing is switched off for this business.");
+    if (status.remaining <= 0) throw new Error("Monthly AI limit reached. Increase the limit to continue.");
+    const draft = await feedbackService.saveAiDraft(actor, clientId, feedback.id, draftFeedbackReplyText(feedback));
+    await this.meterRequest(clientId, true);
+    return draft;
   },
 };
 

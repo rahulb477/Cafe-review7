@@ -40,6 +40,7 @@ before(async () => {
       await setDoc(doc(db, "customers", `cust_${id}`), { clientId: id, name: "Guest", code: "#C1" });
       await setDoc(doc(db, "loyaltyAccounts", `cust_${id}`), { clientId: id, customerId: `cust_${id}`, stamps: 2 });
       await setDoc(doc(db, "clients", id, "reviews", "r1"), { clientId: id, rating: 5, content: "great", createdAt: 1 });
+      await setDoc(doc(db, "clients", id, "feedback", "f_b"), { clientId: id, rating: 4, message: "nice", source: "customer_feedback", status: "new", createdAt: 1 });
       await setDoc(doc(db, "activityLogs", `log_${id}`), { clientId: id, actorUid: SUPER, action: "X", createdAt: 1 });
     }
   });
@@ -63,8 +64,102 @@ test("customer: can submit review + anonymous feedback (validated), cannot injec
   const db = as(null);
   await assertSucceeds(setDoc(doc(db, "clients", STORE_A, "reviews", "new1"), { clientId: STORE_A, rating: 4, content: "nice", createdAt: 1 }));
   await assertFails(setDoc(doc(db, "clients", STORE_A, "reviews", "new2"), { clientId: STORE_A, rating: 9, content: "x" }));
-  await assertSucceeds(setDoc(doc(db, "clients", STORE_A, "feedback", "f1"), { clientId: STORE_A, message: "more jazz", sentiment: "POSITIVE", status: "NEW", createdAt: 1 }));
-  await assertFails(setDoc(doc(db, "clients", STORE_A, "feedback", "f2"), { clientId: STORE_A, message: "x", email: "leak@x.com" }));
+});
+
+// ---------------- FEEDBACK = THE RATING SOURCE ----------------
+test("customer: submits canonical anonymous feedback (rating 1..5 or null)", async () => {
+  const db = as(null);
+  const at = serverTimestamp();
+  await assertSucceeds(
+    setDoc(doc(db, "clients", STORE_A, "feedback", "f1"), {
+      clientId: STORE_A,
+      rating: 5,
+      message: "Excellent",
+      source: "customer_feedback",
+      status: "new",
+      adminReply: null,
+      aiReply: null,
+      repliedAt: null,
+      repliedBy: null,
+      createdAt: at,
+      updatedAt: at,
+    }),
+  );
+  // Text-only feedback (rating null) is valid and must not affect ratings.
+  await assertSucceeds(
+    setDoc(doc(db, "clients", STORE_A, "feedback", "f_null"), {
+      clientId: STORE_A,
+      rating: null,
+      message: "Staff was helpful",
+      source: "customer_feedback",
+      status: "new",
+      createdAt: at,
+      updatedAt: at,
+    }),
+  );
+  // Legacy client shape (no rating, sentiment, uppercase status) stays accepted.
+  await assertSucceeds(
+    setDoc(doc(db, "clients", STORE_A, "feedback", "f_legacy"), {
+      clientId: STORE_A,
+      message: "more jazz",
+      sentiment: "POSITIVE",
+      status: "NEW",
+      createdAt: 1,
+    }),
+  );
+});
+
+test("customer: cannot inject identity, a pre-filled reply, a foreign rating or junk keys", async () => {
+  const db = as(null);
+  const base = { clientId: STORE_A, message: "x", source: "customer_feedback", status: "new" };
+  await assertFails(setDoc(doc(db, "clients", STORE_A, "feedback", "f_bad1"), { ...base, email: "leak@x.com" }));
+  await assertFails(setDoc(doc(db, "clients", STORE_A, "feedback", "f_bad2"), { ...base, rating: 9 }));
+  await assertFails(setDoc(doc(db, "clients", STORE_A, "feedback", "f_bad3"), { ...base, rating: 0 }));
+  await assertFails(setDoc(doc(db, "clients", STORE_A, "feedback", "f_bad4"), { ...base, adminReply: "already answered" }));
+  await assertFails(setDoc(doc(db, "clients", STORE_A, "feedback", "f_bad5"), { ...base, status: "archived" }));
+  await assertFails(setDoc(doc(db, "clients", STORE_A, "feedback", "f_bad6"), { ...base, clientId: STORE_B }));
+  // Feedback is not public: another business cannot read it either.
+  await assertFails(getDocs(collection(db, "clients", STORE_A, "feedback")));
+});
+
+test("admin: moderates and replies to OWN store feedback only", async () => {
+  const db = as(ADMIN_A);
+  await assertSucceeds(
+    updateDoc(doc(db, "clients", STORE_A, "feedback", "f1"), { status: "reviewed", updatedAt: serverTimestamp() }),
+  );
+  await assertSucceeds(
+    updateDoc(doc(db, "clients", STORE_A, "feedback", "f1"), {
+      adminReply: "Thank you!",
+      repliedAt: serverTimestamp(),
+      repliedBy: ADMIN_A,
+      updatedAt: serverTimestamp(),
+    }),
+  );
+  // AI drafts live in aiReply and never touch the customer's message/rating.
+  await assertSucceeds(updateDoc(doc(db, "clients", STORE_A, "feedback", "f1"), { aiReply: "Thanks so much!", updatedAt: serverTimestamp() }));
+  await assertSucceeds(updateDoc(doc(db, "clients", STORE_A, "feedback", "f1"), { status: "archived", updatedAt: serverTimestamp() }));
+
+  // The guest's rating, message and creation time are immutable — even for an admin.
+  await assertFails(updateDoc(doc(db, "clients", STORE_A, "feedback", "f1"), { rating: 1 }));
+  await assertFails(updateDoc(doc(db, "clients", STORE_A, "feedback", "f1"), { message: "rewritten" }));
+  await assertFails(updateDoc(doc(db, "clients", STORE_A, "feedback", "f1"), { createdAt: 1 }));
+  await assertFails(updateDoc(doc(db, "clients", STORE_A, "feedback", "f1"), { updatedAt: Date.now() })); // string/number timestamps are not allowed
+  await assertFails(updateDoc(doc(db, "clients", STORE_A, "feedback", "f1"), { repliedBy: "someone_else" }));
+  await assertFails(updateDoc(doc(db, "clients", STORE_A, "feedback", "f1"), { deviceId: "tracker" }));
+  await assertFails(updateDoc(doc(db, "clients", STORE_A, "feedback", "f1"), { clientId: STORE_B }));
+  await assertFails(deleteDoc(doc(db, "clients", STORE_A, "feedback", "f1")));
+
+  // Cross-business isolation for the rating source.
+  await assertFails(getDocs(collection(db, "clients", STORE_B, "feedback")));
+  await assertFails(updateDoc(doc(db, "clients", STORE_B, "feedback", "f1"), { status: "archived" }));
+});
+
+test("staff and guests cannot moderate feedback (admin-only writes)", async () => {
+  await assertFails(updateDoc(doc(as(STAFF_A), "clients", STORE_A, "feedback", "f1"), { status: "reviewed" }));
+  await assertFails(updateDoc(doc(as(null), "clients", STORE_A, "feedback", "f1"), { status: "reviewed" }));
+  await assertFails(getDocs(collection(as(STAFF_A), "clients", STORE_A, "feedback")));
+  // SUPER_ADMIN is a store admin too — replying is allowed for them.
+  await assertSucceeds(updateDoc(doc(as(SUPER), "clients", STORE_A, "feedback", "f_legacy"), { adminReply: "hi", repliedBy: SUPER, repliedAt: serverTimestamp(), updatedAt: serverTimestamp() }));
 });
 test("customer: metrics blind-merge allowed only for valid id + known fields", async () => {
   const db = as(null);
